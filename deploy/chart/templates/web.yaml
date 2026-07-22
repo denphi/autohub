@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-web
+  labels:
+    {{- include "autohub.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  replicas: {{ .Values.web.replicas }}
+  # RWO volumes: the old pod must release them before the new one attaches.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: web
+  template:
+    metadata:
+      labels:
+        {{- include "autohub.labels" . | nindent 8 }}
+        app.kubernetes.io/component: web
+      annotations:
+        # roll the pod when the manifest changes
+        checksum/manifest: {{ .Values.hubManifest | sha256sum }}
+    spec:
+      # No wait-for-db initContainer: the entrypoint already blocks on its own
+      # wait_for_db (used by hub-db-init and hub-migrate) using the mariadb
+      # client, so the db race is handled by the image's own tested logic. (An
+      # nc-based initContainer would also need netcat, which the image lacks.)
+      containers:
+        - name: web
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            {{- include "autohub.env" . | nindent 12 }}
+          ports:
+            - { name: http,  containerPort: 80 }
+            - { name: https, containerPort: 443 }
+          volumeMounts:
+            - { name: src, mountPath: /var/www/html }
+            - { name: app, mountPath: /var/www/html/app }
+            - { name: tls, mountPath: /etc/hubzero/tls }
+            - { name: manifest, mountPath: /etc/hubzero/hub.yml, subPath: hub.yml, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /, port: https, scheme: HTTPS }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 40   # first boot (clone+composer+schema) is slow
+          resources:
+            {{- toYaml .Values.web.resources | nindent 12 }}
+        {{- if .Values.web.cron.enabled }}
+        - name: cron
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["hub-cron"]
+          env:
+            {{- include "autohub.env" . | nindent 12 }}
+            - name: HUB_CRON_INTERVAL
+              value: {{ .Values.web.cron.interval | quote }}
+          volumeMounts:
+            - { name: src, mountPath: /var/www/html }
+            - { name: app, mountPath: /var/www/html/app }
+        {{- end }}
+      volumes:
+        - { name: src, persistentVolumeClaim: { claimName: {{ .Release.Name }}-src } }
+        - { name: app, persistentVolumeClaim: { claimName: {{ .Release.Name }}-app } }
+        - { name: tls, persistentVolumeClaim: { claimName: {{ .Release.Name }}-tls } }
+        - name: manifest
+          configMap:
+            name: {{ .Release.Name }}-manifest
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-web
+  labels:
+    {{- include "autohub.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: web
+  ports:
+    - { name: http,  port: 80,  targetPort: http }
+    - { name: https, port: 443, targetPort: https }

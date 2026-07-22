@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-db
+  labels:
+    {{- include "autohub.labels" . | nindent 4 }}
+    app.kubernetes.io/component: db
+spec:
+  serviceName: {{ .Release.Name }}-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: db
+  template:
+    metadata:
+      labels:
+        {{- include "autohub.labels" . | nindent 8 }}
+        app.kubernetes.io/component: db
+    spec:
+      containers:
+        - name: db
+          image: {{ .Values.db.image }}
+          # HUBzero's schema.sql needs relaxed sql-mode + utf8mb3 (see compose).
+          args:
+            - --sql-mode=
+            - --character-set-server=utf8mb3
+            - --collation-server=utf8mb3_general_ci
+            - --innodb-buffer-pool-size=512M
+          env:
+            - { name: MARIADB_DATABASE, value: {{ .Values.env.DB_NAME | quote }} }
+            - { name: MARIADB_USER,     value: {{ .Values.env.DB_USER | quote }} }
+            - name: MARIADB_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ include "autohub.secretName" . }}, key: DB_PASSWORD } }
+            - name: MARIADB_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ include "autohub.secretName" . }}, key: DB_ROOT_PASSWORD } }
+          ports:
+            - { name: mysql, containerPort: 3306 }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/mysql }
+          livenessProbe:
+            exec: { command: ["healthcheck.sh", "--connect", "--innodb_initialized"] }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec: { command: ["healthcheck.sh", "--connect", "--innodb_initialized"] }
+            periodSeconds: 5
+            failureThreshold: 30
+          resources:
+            {{- toYaml .Values.db.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.db.storage.storageClassName }}
+        storageClassName: {{ .Values.db.storage.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.db.storage.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-db
+  labels:
+    {{- include "autohub.labels" . | nindent 4 }}
+    app.kubernetes.io/component: db
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: db
+  ports:
+    - { name: mysql, port: 3306, targetPort: mysql }

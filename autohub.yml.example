@@ -1,0 +1,24 @@
+# autohub.yml — infrastructure manifest (distinct from hub.yml, which is the
+# hub itself). Selects the driver and its settings. Absent = docker defaults.
+# Committed; contains no secrets (those stay in .env).
+
+# docker (default) drives docker compose locally.
+# kubernetes drives kubectl + helm against a cluster (needs deploy/chart/).
+driver: docker
+
+# Only read when driver: kubernetes.
+kubernetes:
+  namespace: autohub        # namespace to install into (created if missing)
+  release: autohub          # helm release name; prefixes the workloads
+  context: ""               # kube context to target ("" = current)
+  chart: deploy/chart       # path to the bundled Helm chart
+  ingress_host: ""          # external host for `autohub url`/verify (set to your Ingress host)
+
+# Recurring database backup (kubernetes driver only — renders a CronJob with its
+# own volume). Docker hubs back up on-demand (`autohub db dump`) and before every
+# `autohub update`. Keys are flat (enabled/schedule/keep); volume size lives in
+# the chart's values.yaml.
+backup:
+  enabled: false
+  schedule: "0 3 * * *"     # cron expression, cluster time (daily 03:00)
+  keep: 7                   # retain the newest N dumps, prune older

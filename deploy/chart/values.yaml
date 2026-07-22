@@ -1,0 +1,104 @@
+# autohub Helm values. Mirrors docker-compose.yml's env/topology so the same
+# image and the same first-boot entrypoint run unchanged on a cluster.
+#
+# Secrets are read from an existing Secret (see `secret.existingSecret`) or,
+# for a quick start, from `secret.data` below — never commit real values there.
+
+image:
+  repository: autohub/hubzero
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Non-secret hub environment (the compose x-hub-env block, minus passwords).
+env:
+  HUB_ROOT: /var/www/html
+  HUBZERO_REPO: https://github.com/hubzero/hubzero-cms.git
+  HUBZERO_REF: 2.4-main
+  HUBZERO_AUTO_UPDATE: "0"
+  DB_HOST: "" # defaulted to <release>-db in _helpers if left empty
+  DB_PORT: "3306"
+  DB_NAME: hubzero
+  DB_USER: hubzero
+  DB_PREFIX: jos_
+  HUB_SITENAME: AutoHub
+  HUB_ENV: production
+  HUB_DEBUG: "0"
+  HUB_ERROR_REPORTING: none
+  HUB_TIMEZONE: UTC
+  HUB_FORCE_SSL: "0"
+  HUB_TLS_CN: localhost
+  HUB_ADMIN_USER: admin
+  HUB_ADMIN_EMAIL: admin@example.com
+  HUB_ADMIN_NAME: Administrator
+  HUB_LOAD_SAMPLE_DATA: "0"
+  HUB_MAILER: smtp
+  HUB_MAIL_FROM: hub@example.com
+  HUB_MAIL_FROMNAME: AutoHub
+  HUB_SMTP_HOST: "" # defaulted to <release>-mail if left empty
+  HUB_SMTP_PORT: "1025"
+  HUB_SMTP_SECURE: none
+  HUB_SMTP_AUTH: "0"
+  HUB_SMTP_USER: ""
+
+# Secret material. Prefer existingSecret in real deployments.
+secret:
+  existingSecret: ""      # name of a pre-created Secret with the keys below
+  data:                   # used only if existingSecret is empty
+    DB_PASSWORD: ""
+    DB_ROOT_PASSWORD: ""
+    HUB_SECRET: ""
+    HUB_ADMIN_PASSWORD: ""
+    HUB_SMTP_PASSWORD: ""
+
+# hub.yml — the declarative hub. Pasted into a ConfigMap and mounted at
+# /etc/hubzero/hub.yml (read-only), exactly as compose bind-mounts it.
+hubManifest: |
+  # site: My Hub
+
+web:
+  replicas: 1             # HUBzero sessions/uploads are not share-nothing; keep 1
+  cron:
+    enabled: true         # runs hub-cron as a sidecar sharing the web volumes
+    interval: "60"
+  resources:
+    requests: { cpu: "500m", memory: "1Gi" }
+    limits:   { cpu: "2",    memory: "3Gi" }
+  storage:
+    src: { size: 8Gi }    # the CMS checkout (hub_src)
+    app: { size: 8Gi }    # config, uploads, logs, cache, sessions (hub_app)
+    tls: { size: 16Mi }   # certs (hub_tls)
+    storageClassName: ""  # "" = cluster default
+
+db:
+  image: mariadb:10.11
+  storage:
+    size: 10Gi
+    storageClassName: ""
+  resources:
+    requests: { cpu: "500m", memory: "768Mi" }
+    limits:   { cpu: "2",    memory: "1Gi" }
+
+mail:
+  enabled: true           # in-cluster mailpit sink (compose parity)
+  image: axllent/mailpit:latest
+
+# Recurring database backup (CronJob). hub-backup dumps over the network, so
+# this needs only DB access + its own volume — no conflict with the web pod's
+# RWO app volume. Toggle/schedule/retention are driven from autohub.yml.
+backup:
+  enabled: false
+  schedule: "0 3 * * *"   # daily at 03:00 (cluster time)
+  keep: 7                 # retain the newest N dumps, prune older
+  storage:
+    size: 10Gi
+    storageClassName: ""
+
+service:
+  type: ClusterIP
+
+ingress:
+  enabled: false
+  className: ""
+  host: ""                # must match kubernetes.ingress_host in autohub.yml
+  tls: true
+  annotations: {}

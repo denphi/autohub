@@ -1,0 +1,21 @@
+{{- /* hub_src, hub_app, hub_tls as RWO PVCs. Single web pod (replicas 1) plus
+       the cron sidecar share them within the pod, so RWO is sufficient. */ -}}
+{{- range $vol := (list (dict "n" "src" "s" $.Values.web.storage.src.size)
+                        (dict "n" "app" "s" $.Values.web.storage.app.size)
+                        (dict "n" "tls" "s" $.Values.web.storage.tls.size)) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $.Release.Name }}-{{ $vol.n }}
+  labels:
+    {{- include "autohub.labels" $ | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- if $.Values.web.storage.storageClassName }}
+  storageClassName: {{ $.Values.web.storage.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $vol.s }}
+{{- end }}

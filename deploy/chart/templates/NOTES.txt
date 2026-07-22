@@ -1,0 +1,25 @@
+autohub ({{ .Release.Name }}) is installing into namespace {{ .Release.Namespace }}.
+
+First boot is slow: the web pod's entrypoint clones the CMS, runs composer,
+loads + repairs the schema, creates the admin and provisions hub.yml — several
+minutes. Watch it:
+
+  kubectl -n {{ .Release.Namespace }} logs -f deployment/{{ .Release.Name }}-web -c web
+
+The hub is ready when the log prints "bootstrap complete". Then, from the repo:
+
+  autohub verify        # proves site, assets, login and db (uses autohub.yml)
+  autohub status
+
+{{- if .Values.ingress.enabled }}
+Reach it at https://{{ .Values.ingress.host }}/ (set kubernetes.ingress_host in
+autohub.yml to the same host so `autohub verify` targets it).
+{{- else }}
+No Ingress is enabled. Port-forward to reach it:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ .Release.Name }}-web 8443:443
+{{- end }}
+
+Provisioning and asset rebuilds run inside the live web pod (RWO volumes are
+held by that pod), which is exactly what `autohub provision` / `autohub assets`
+do via the kubernetes driver.

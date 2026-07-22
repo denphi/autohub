@@ -1,0 +1,163 @@
+# Declarative hub setup. Copy to hub.yml and edit.
+#
+#   cp hub.yml.example hub.yml && make provision
+#
+# Everything here is applied idempotently on every boot, so this file -- not a
+# sequence of clicks in the admin UI -- is the description of your hub. Delete
+# any section you do not need; an absent section is left alone entirely.
+#
+# ${VAR} is substituted from the environment (.env). Never write a token here:
+# this file is meant to be committed, .env is not.
+#
+# What .env owns vs what this file owns:
+#   .env      infrastructure -- ports, database, TLS, mail, site name, debug
+#   hub.yml   the hub itself -- extensions, template, plugins, content
+
+# --- Custom extensions ------------------------------------------------------
+# Cloned into app/<type-plural>/<alias>, registered with the CMS, and their own
+# migrations run. Re-running fetches and fast-forwards instead of re-cloning.
+extensions:
+  - type: template          # template | component | module | plugin
+    alias: custom           # must match <name> in the extension's manifest
+    url: https://git.example.org/hub/tpl_custom.git
+    branch: main
+    token: ${GITLAB_TOKEN}  # optional; injected as oauth2:<token>@host
+  # - type: plugin
+  #   folder: members       # plugins live at app/plugins/<folder>/<alias>
+  #   alias: mytab
+  #   url: https://gitlab.example.org/hub/plg_members_mytab.git
+
+# --- Active site template ---------------------------------------------------
+template:
+  site: custom
+  # admin: kameleon
+
+# --- Plugins ----------------------------------------------------------------
+# The install step registers every shipped plugin with upstream's default
+# state, which rarely matches what a given hub wants.
+plugins:
+  enable:
+    - user/hubzero
+    - system/incomplete
+  disable:
+    - user/constantcontact
+  # Per-plugin settings, merged into the plugin's existing params.
+  params:
+    editors/ckeditor:
+      sourceViewButton: 1   # adds the "Source" button; off by default
+
+# --- Component configuration ------------------------------------------------
+# Equivalent to Components > <name> > Options in the admin UI. Params are
+# MERGED into the component's existing settings -- listing one key never wipes
+# the others -- so you only name what you want to change.
+components:
+  com_members:
+    allowUserRegistration: 1
+    useractivation: 1
+  com_courses:
+    tmpl: default         # which course template com_courses renders through
+
+# --- Seed opt-outs ----------------------------------------------------------
+# Provisioning always applies a few unconditional fixes for gaps the CMS
+# installer leaves. They default ON; set one false only if your hub handles
+# that gap another way.
+#   admin_menu            -> point the admin 'menu' module at mod_adminmenu, so
+#                            the backend actually has navigation.
+#   support_query_folders -> seed com_support's core query folders, without
+#                            which /support/tickets 500s.
+#   oauth_internal_client -> seed com_developer's internal request client
+#                            (hub_account=1). Without it, first-party API calls
+#                            (the course editor, tool sessions) 401 with
+#                            "invalid_token"; the CMS self-heal fails on any
+#                            localhost host.
+# seeds:
+#   admin_menu: true
+#   support_query_folders: true
+#   oauth_internal_client: true
+
+# --- Resource types ---------------------------------------------------------
+# category 27 = "Main Types", 28 = sub-resources, 30 = link/file types.
+# `id` is pinned because resources reference their type by id -- keeping these
+# stable is what makes content portable between deployments.
+# Matched on id, so editing an entry updates rather than duplicates it.
+#
+# Do NOT rely on HUB_LOAD_SAMPLE_DATA for these: sample.sql's resource_types
+# rows supply 8 values for a 10-column table and fail to load at all.
+#
+# Keep this example small; define only the types required by your deployment.
+resource_types:
+  - { id: 1, alias: publications, type: Publications, category: 27, state: 1 }
+  - { id: 2, alias: datasets,     type: Datasets,     category: 27, state: 1 }
+  - { id: 3, alias: tools,        type: Tools,        category: 27, state: 1 }
+
+# --- Example content --------------------------------------------------------
+# Matched on title, so editing one here updates rather than duplicates it.
+# `type` is a resource_type alias from above.
+resources:
+  - title: Example Simulation Tool
+    type: tools
+    published: 1
+    introtext: A placeholder tool resource created by hub-provision.
+    fulltxt: >
+      Replace this with real content, or drop the `resources:` section
+      entirely once the hub has its own.
+
+# --- Groups -----------------------------------------------------------------
+groups:
+  - cn: testers
+    description: Test Group
+    type: 1              # 1 = hub group
+    public: 1
+    members: [tester]
+
+# --- Users ------------------------------------------------------------------
+# The administrator comes from HUB_ADMIN_* in .env; these are extra accounts
+# for exercising permissions. Passwords must come from the environment.
+users:
+  - username: tester
+    name: Test User
+    email: tester@example.com
+    password: ${TEST_USER_PASSWORD}
+
+# --- Modules ----------------------------------------------------------------
+# Position matters more than it looks: a module in a position the active
+# template does not render is invisible, with no error anywhere. mod_menu ships
+# in Joomla's "position-7", which most HUBzero templates never output.
+modules:
+  mod_menu:
+    position: user3          # where THIS template renders its main nav
+    params:
+      showAllChildren: 1     # without this, sub-items never render -> no dropdowns
+      endLevel: 0            # 0 = all levels
+  mod_login:
+    published: 0             # this template hardcodes login into its aux nav
+
+# --- Menus ------------------------------------------------------------------
+# Either a bare list of items, or a map with `items:` and options.
+#
+#   prune: true   the rendered menu matches this list exactly -- anything else
+#                 in the menu is *unpublished* (never deleted, so hand-built
+#                 items stay recoverable)
+#
+# `home: true` marks the front page; exactly one site item may have it.
+# Aliases need only be unique among siblings, not across the whole menu.
+menus:
+  site:
+    prune: true
+    items:
+      - title: Home
+        alias: home
+        link: index.php?option=com_resources
+        home: true
+
+      - title: Explore
+        alias: explore
+        link: index.php?option=com_resources
+        children:
+          - { title: Tools,     alias: tools,     link: /resources/tools, type: url }
+          - { title: Resources, alias: resources, link: index.php?option=com_resources }
+
+# A component link (the default `type`) is resolved to its component_id.
+# Leaving that unset does not merely lose metadata -- the router then serves a
+# different component entirely. An unregistered component is reported as an
+# error rather than written as a broken item.

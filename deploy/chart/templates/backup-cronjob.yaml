@@ -1,0 +1,60 @@
+{{- if .Values.backup.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-backup
+  labels:
+    {{- include "autohub.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- if .Values.backup.storage.storageClassName }}
+  storageClassName: {{ .Values.backup.storage.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.backup.storage.size }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-backup
+  labels:
+    {{- include "autohub.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid          # RWO backup volume; never overlap runs
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "autohub.labels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # Override the image entrypoint: just dump + prune, no bootstrap.
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  hub-backup
+                  # retention: keep the newest {{ .Values.backup.keep }}, delete older
+                  ls -1t /var/www/html/app/backups/*.sql.gz 2>/dev/null \
+                    | tail -n +{{ add .Values.backup.keep 1 }} | xargs -r rm -f
+              env:
+                {{- include "autohub.env" . | nindent 16 }}
+              volumeMounts:
+                - { name: backup, mountPath: /var/www/html/app/backups }
+          volumes:
+            - name: backup
+              persistentVolumeClaim:
+                claimName: {{ .Release.Name }}-backup
+{{- end }}

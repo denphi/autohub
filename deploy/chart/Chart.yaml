@@ -1,0 +1,6 @@
+apiVersion: v2
+name: autohub
+description: HUBzero CMS hub — the docker-compose topology as a Helm chart (see DESIGN.md §4.4).
+type: application
+version: 0.1.0
+appVersion: "2.4"

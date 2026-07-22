@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-manifest
+  labels:
+    {{- include "autohub.labels" . | nindent 4 }}
+data:
+  # Mounted at /etc/hubzero/hub.yml, exactly where compose bind-mounts it.
+  hub.yml: |
+    {{- .Values.hubManifest | nindent 4 }}

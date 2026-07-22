@@ -1,0 +1,5 @@
+# The image contains no application source, so the build context only needs the
+# docker/ directory. Excluding everything else keeps builds fast and prevents a
+# stray .env from being baked in.
+*
+!docker

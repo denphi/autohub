@@ -1,0 +1,47 @@
+# Development overlay: serve a local checkout instead of the managed volume.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#   (or just `make dev`)
+#
+# Edits on the host are live -- no rebuild, no restart. app/ stays in a volume
+# so config, uploads and caches never land in your working tree.
+
+services:
+  web:
+    environment:
+      # Tells hub-source-sync to keep its hands off: the checkout is yours.
+      HUB_SOURCE_MODE: external
+      HUB_ENV: development
+      HUB_DEBUG: "1"
+    volumes:
+      - ${HUB_SOURCE_PATH:-./hubzero-cms}:/var/www/html
+      - hub_app:/var/www/html/app
+
+  cron:
+    environment:
+      HUB_SOURCE_MODE: external
+    volumes:
+      - ${HUB_SOURCE_PATH:-./hubzero-cms}:/var/www/html
+      - hub_app:/var/www/html/app
+
+  db:
+    ports:
+      # Exposed for a local SQL client. Never do this in production.
+      - "${DB_PORT:-3306}:3306"
+
+  # Catches every message the hub sends; nothing escapes to real inboxes.
+  mail:
+    image: axllent/mailpit:latest
+    ports:
+      - "${MAILPIT_PORT:-8025}:8025"
+    restart: unless-stopped
+
+  adminer:
+    image: adminer:5
+    environment:
+      ADMINER_DEFAULT_SERVER: db
+    ports:
+      - "${ADMINER_PORT:-8081}:8080"
+    depends_on:
+      - db
+    restart: unless-stopped

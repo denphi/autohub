@@ -1,0 +1,152 @@
+# Deployable HUBzero stack.
+#
+# The web image carries no application code. On first start the entrypoint
+# checks the CMS out into the hub_src volume, installs dependencies, renders
+# app/config from this file's environment, loads the schema and creates the
+# administrator. Updating the hub afterwards is `make update` -- a git fetch
+# inside the running container, not an image rebuild.
+
+name: autohub
+
+x-hub-env: &hub-env
+  HUB_ROOT: /var/www/html
+
+  # Source. HUBZERO_REF may be a branch, tag or commit sha.
+  HUBZERO_REPO: ${HUBZERO_REPO:-https://github.com/hubzero/hubzero-cms.git}
+  HUBZERO_REF: ${HUBZERO_REF:-2.4-main}
+  HUBZERO_AUTO_UPDATE: ${HUBZERO_AUTO_UPDATE:-0}
+
+  # Database
+  DB_HOST: db
+  DB_PORT: "3306"
+  DB_NAME: ${DB_NAME:-hubzero}
+  DB_USER: ${DB_USER:-hubzero}
+  DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set -- copy .env.example to .env}
+  DB_PREFIX: ${DB_PREFIX:-jos_}
+
+  # Site
+  HUB_SITENAME: ${HUB_SITENAME:-AutoHub}
+  HUB_ENV: ${HUB_ENV:-production}
+  HUB_DEBUG: ${HUB_DEBUG:-0}
+  # 'none' is deliberate -- see .env.example.
+  HUB_ERROR_REPORTING: ${HUB_ERROR_REPORTING:-none}
+  HUB_TIMEZONE: ${HUB_TIMEZONE:-UTC}
+  HUB_FORCE_SSL: ${HUB_FORCE_SSL:-0}
+  HUB_LIVE_SITE: ${HUB_LIVE_SITE:-}
+  HUB_SECRET: ${HUB_SECRET:-}
+  HUB_TLS_CN: ${HUB_TLS_CN:-localhost}
+
+  # Initial administrator (only used while the database is empty)
+  HUB_ADMIN_USER: ${HUB_ADMIN_USER:-admin}
+  HUB_ADMIN_PASSWORD: ${HUB_ADMIN_PASSWORD:-}
+  HUB_ADMIN_EMAIL: ${HUB_ADMIN_EMAIL:-admin@example.com}
+  HUB_ADMIN_NAME: ${HUB_ADMIN_NAME:-Administrator}
+  HUB_LOAD_SAMPLE_DATA: ${HUB_LOAD_SAMPLE_DATA:-0}
+
+  # Mail
+  HUB_MAILER: ${HUB_MAILER:-smtp}
+  HUB_MAIL_FROM: ${HUB_MAIL_FROM:-hub@example.com}
+  HUB_MAIL_FROMNAME: ${HUB_MAIL_FROMNAME:-AutoHub}
+  HUB_SMTP_HOST: ${HUB_SMTP_HOST:-mail}
+  HUB_SMTP_PORT: ${HUB_SMTP_PORT:-1025}
+  HUB_SMTP_SECURE: ${HUB_SMTP_SECURE:-none}
+  HUB_SMTP_AUTH: ${HUB_SMTP_AUTH:-0}
+  HUB_SMTP_USER: ${HUB_SMTP_USER:-}
+  HUB_SMTP_PASSWORD: ${HUB_SMTP_PASSWORD:-}
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: ${HUB_IMAGE:-autohub/hubzero:latest}
+    # Everything in .env is exposed to the container so that any ${VAR} used in
+    # hub.yml resolves without having to be declared here too. The explicit
+    # block below still wins for the keys it names.
+    env_file:
+      - .env
+    environment: *hub-env
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+      # HUBzero's admin login hardcodes a redirect to https, so this is not
+      # optional -- without it the hub cannot be administered.
+      - "${HTTPS_PORT:-8443}:443"
+    volumes:
+      # The CMS checkout. Survives image rebuilds; updated with `make update`.
+      - hub_src:/var/www/html
+      # PATH_APP: config, uploads, logs, cache, sessions. Nested inside hub_src
+      # so a source reset never destroys site data.
+      - hub_app:/var/www/html/app
+      # Mount real certificates here (hub.crt / hub.key) to replace the
+      # self-signed pair generated on first boot.
+      - hub_tls:/etc/hubzero/tls
+      # Declarative hub setup. Deliberately NOT under app/: that tree is runtime
+      # state the entrypoint chowns, and a read-only mount inside it makes
+      # `chown -R` fail and crashloop the container. `make up` creates an empty
+      # hub.yml if absent -- the file must exist or Docker mounts a directory.
+      - ./hub.yml:/etc/hubzero/hub.yml:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Catch-all SMTP sink (mailpit). HUBzero raises an *uncaught* exception when it
+  # cannot reach the configured mail host, so any email-sending action -- e.g.
+  # saving a group fires a "group changed" notification -- 500s without a
+  # reachable SMTP server. mailpit accepts everything on :1025 and never forwards
+  # it, so the hub works out of the box (.env defaults HUB_SMTP_HOST=mail). For
+  # real delivery in production, point HUB_SMTP_HOST / HUB_SMTP_PORT at a relay.
+  # Read caught messages at http://localhost:${MAILPIT_PORT:-8025}.
+  mail:
+    image: axllent/mailpit:latest
+    ports:
+      - "${MAILPIT_PORT:-8025}:8025"
+    restart: unless-stopped
+
+  cron:
+    image: ${HUB_IMAGE:-autohub/hubzero:latest}
+    command: ["hub-cron"]
+    # The image's HTTP healthcheck belongs to the web server; this container
+    # runs no Apache and would report unhealthy forever.
+    healthcheck:
+      disable: true
+    environment:
+      <<: *hub-env
+      HUB_CRON_INTERVAL: ${HUB_CRON_INTERVAL:-60}
+    volumes:
+      - hub_src:/var/www/html
+      - hub_app:/var/www/html/app
+    depends_on:
+      web:
+        condition: service_started
+    restart: unless-stopped
+
+  db:
+    image: mariadb:10.11
+    # HUBzero's schema.sql is a utf8mb3 dump full of '0000-00-00' defaults and
+    # zero-length AUTO_INCREMENT assumptions; strict mode rejects it outright.
+    command:
+      - --sql-mode=
+      - --character-set-server=utf8mb3
+      - --collation-server=utf8mb3_general_ci
+      - --innodb-buffer-pool-size=512M
+    environment:
+      MARIADB_DATABASE: ${DB_NAME:-hubzero}
+      MARIADB_USER: ${DB_USER:-hubzero}
+      MARIADB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD must be set}
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  hub_src:
+  hub_app:
+  hub_tls:
+  db_data:

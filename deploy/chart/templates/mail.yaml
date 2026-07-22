@@ -1,0 +1,42 @@
+{{- if .Values.mail.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-mail
+  labels:
+    {{- include "autohub.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mail
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: mail
+  template:
+    metadata:
+      labels:
+        {{- include "autohub.labels" . | nindent 8 }}
+        app.kubernetes.io/component: mail
+    spec:
+      containers:
+        - name: mail
+          image: {{ .Values.mail.image }}
+          ports:
+            - { name: smtp, containerPort: 1025 }
+            - { name: ui,   containerPort: 8025 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-mail
+  labels:
+    {{- include "autohub.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mail
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: mail
+  ports:
+    - { name: smtp, port: 1025, targetPort: smtp }
+    - { name: ui,   port: 8025, targetPort: ui }
+{{- end }}

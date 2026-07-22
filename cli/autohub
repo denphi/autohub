@@ -1,0 +1,1330 @@
+#!/usr/bin/env python3
+"""autohub — one CLI for creating and maintaining a HUBzero hub.
+
+Design: DESIGN.md. This is M1: a thin, stdlib-only wrapper over the existing
+scripts (scripts/hub-init.sh, in-container hub-*) behind a driver abstraction,
+with a machine-readable contract so a human, CI, or an AI Skill can drive it.
+
+Contract:
+  - non-interactive by default
+  - `--json` prints exactly one JSON object: {ok, action, details, checks, next}
+  - exit codes: 0 ok · 1 operation failed · 2 verification failed · 3 bad usage
+  - idempotent where the wrapped operation allows it
+  - no secrets in argv or output
+
+Only the Driver knows about Docker or Kubernetes; `autohub.yml` selects the
+target without changing command workflows.
+"""
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import time
+import urllib.request
+import urllib.parse
+
+# ---------------------------------------------------------------------------
+# project + env
+# ---------------------------------------------------------------------------
+
+def find_project_dir(start):
+    """Walk up until we find docker-compose.yml (the project root)."""
+    d = os.path.abspath(start)
+    while True:
+        if os.path.isfile(os.path.join(d, "docker-compose.yml")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def read_env(project_dir):
+    """Parse .env into a dict. Simple KEY=VALUE, ignores comments/blank."""
+    env = {}
+    path = os.path.join(project_dir, ".env")
+    if not os.path.isfile(path):
+        return env
+    for line in open(path, encoding="utf-8", errors="replace"):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        v = v.strip().strip('"').strip("'")
+        env[k.strip()] = v
+    return env
+
+
+def read_autohub_config(project_dir):
+    """Parse autohub.yml — the infrastructure manifest (driver selection, k8s
+    settings). Absent = docker defaults. A deliberately tiny two-level parser so
+    the CLI keeps its zero-dependency promise; the schema is shallow and ours.
+    """
+    path = os.path.join(project_dir, "autohub.yml")
+    cfg = {}
+    if not os.path.isfile(path):
+        return cfg
+    parent = None
+    for raw in open(path, encoding="utf-8", errors="replace"):
+        line = raw.rstrip("\n")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indented = line[0] in " \t"
+        key, _, val = line.strip().partition(":")
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        if not indented:
+            if val == "":
+                cfg[key] = {}
+                parent = key
+            else:
+                cfg[key] = val
+                parent = None
+        elif parent is not None:
+            cfg[parent][key] = val
+    return cfg
+
+
+SECRET_RE = re.compile(
+    r"(glpat-[A-Za-z0-9._-]+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]+|"
+    r"xox[baprs]-[A-Za-z0-9-]+|(?:PASSWORD|PASS|TOKEN|SECRET)=\S+)",
+    re.IGNORECASE)
+
+def scrub(text):
+    """Never let a token or password reach output or logs (R8)."""
+    return SECRET_RE.sub("[redacted]", text or "")
+
+
+# ---------------------------------------------------------------------------
+# driver layer
+# ---------------------------------------------------------------------------
+
+class DockerDriver:
+    """Run the hub as a Docker Compose project."""
+
+    name = "docker"
+
+    def __init__(self, project_dir, env, dev=False):
+        self.dir = project_dir
+        self.env = env
+        base = ["docker", "compose"]
+        if dev:
+            base += ["-f", "docker-compose.yml", "-f", "docker-compose.dev.yml"]
+        self.compose = base
+
+    def _run(self, args, capture=True, check=False, stdin=None, timeout=None):
+        return subprocess.run(
+            args, cwd=self.dir, capture_output=capture, text=True,
+            check=check, input=stdin, timeout=timeout)
+
+    def exec(self, service, cmd, stdin=None, timeout=None):
+        """Run a command inside a service container (non-tty)."""
+        return self._run(self.compose + ["exec", "-T", service] + cmd,
+                         stdin=stdin, timeout=timeout)
+
+    def up(self):
+        return self._run(self.compose + ["up", "-d", "--build"])
+
+    def down(self, volumes=False):
+        args = self.compose + ["-f", os.path.join(self.dir, "docker-compose.yml"),
+                               "-f", os.path.join(self.dir, "docker-compose.dev.yml"),
+                               "down"] + (["-v"] if volumes else [])
+        return self._run(args)
+
+    def logs(self, service=None, tail=None, follow=False):
+        args = self.compose + ["logs", "--no-log-prefix"]
+        if tail:
+            args += ["--tail", str(tail)]
+        if follow:
+            args += ["-f"]
+        if service:
+            args += [service]
+        if follow:
+            return self._run(args, capture=False)
+        return self._run(args)
+
+    def status(self):
+        r = self._run(self.compose + ["ps", "--format", "json"])
+        services = []
+        for line in (r.stdout or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                j = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            services.append({
+                "service": j.get("Service") or j.get("Name", ""),
+                "state": j.get("State", ""),
+                "health": j.get("Health", ""),
+            })
+        return services
+
+    def restart(self, service):
+        return self._run(self.compose + ["restart", service])
+
+    def shell(self, service, cmd):
+        """Interactive (tty) exec — inherits the terminal, no capture."""
+        return subprocess.run(self.compose + ["exec", service] + cmd, cwd=self.dir)
+
+    def stream_to_file(self, service, cmd, path):
+        """Stream binary command output to a host file without buffering it."""
+        with open(path, "wb") as out:
+            r = subprocess.run(self.compose + ["exec", "-T", service] + cmd,
+                               cwd=self.dir, stdout=out, stderr=subprocess.PIPE)
+        return subprocess.CompletedProcess(r.args, r.returncode, "",
+                                           r.stderr.decode("utf-8", "replace"))
+
+    def stream_from_file(self, service, cmd, path):
+        """Stream a host file to a command's stdin without putting it in argv."""
+        with open(path, "rb") as src:
+            r = subprocess.run(self.compose + ["exec", "-T", service] + cmd,
+                               cwd=self.dir, stdin=src, capture_output=True)
+        return subprocess.CompletedProcess(r.args, r.returncode,
+            r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace"))
+
+    def target_id(self):
+        return "docker:" + os.path.realpath(self.dir)
+
+    def url(self):
+        return "https://localhost:%s" % self.env.get("HTTPS_PORT", "8443")
+
+
+# ---------------------------------------------------------------------------
+# kubernetes driver (v2) — same interface, drives kubectl/helm instead of
+# compose. Selected by `driver: kubernetes` in autohub.yml. Requires kubectl,
+# helm and a reachable cluster; see deploy/chart/.
+# ---------------------------------------------------------------------------
+
+class KubernetesDriver:
+    name = "kubernetes"
+
+    # compose service name -> (kubectl workload ref, container name)
+    WORKLOADS = {
+        "web":  ("deployment/{rel}-web", "web"),
+        "cron": ("deployment/{rel}-web", "cron"),   # cron is a sidecar in the web pod
+        "db":   ("statefulset/{rel}-db", "db"),
+        "mail": ("deployment/{rel}-mail", "mail"),
+    }
+
+    # .env keys that become the chart's Secret (never passed on argv)
+    SECRET_KEYS = ["DB_PASSWORD", "DB_ROOT_PASSWORD", "HUB_SECRET",
+                   "HUB_ADMIN_PASSWORD", "HUB_SMTP_PASSWORD"]
+    # non-secret .env keys carried into the chart (hub identity/source)
+    ENV_KEYS = ["HUBZERO_REPO", "HUBZERO_REF", "DB_NAME", "DB_USER", "DB_PREFIX",
+                "HUB_SITENAME", "HUB_ADMIN_USER", "HUB_ADMIN_EMAIL",
+                "HUB_ADMIN_NAME", "HUB_TIMEZONE"]
+
+    def __init__(self, project_dir, env, cfg):
+        self.dir = project_dir
+        self.env = env
+        self.cfg = cfg
+        kc = cfg.get("kubernetes") if isinstance(cfg.get("kubernetes"), dict) else {}
+        self.backup = cfg.get("backup") if isinstance(cfg.get("backup"), dict) else {}
+        self.ns = kc.get("namespace", "autohub")
+        self.rel = kc.get("release", "autohub")
+        self.chart = kc.get("chart", "deploy/chart")
+        self.ingress_host = kc.get("ingress_host", "")
+        ctx = kc.get("context", "")
+        self.context = ctx
+        base = ["kubectl"] + (["--context", ctx] if ctx else [])
+        self._kubectl_base = base                 # no namespace (for ns ops)
+        self._kubectl = base + ["-n", self.ns]
+        self._helm = ["helm"] + (["--kube-context", ctx] if ctx else []) + ["-n", self.ns]
+
+    def _run(self, args, capture=True, stdin=None, timeout=None):
+        return subprocess.run(args, cwd=self.dir, capture_output=capture,
+                              text=True, input=stdin, timeout=timeout)
+
+    def _ref(self, service):
+        if service not in self.WORKLOADS:
+            raise Exception("unknown service '%s' for kubernetes driver" % service)
+        ref, container = self.WORKLOADS[service]
+        return ref.format(rel=self.rel), container
+
+    def exec(self, service, cmd, stdin=None, timeout=None):
+        ref, container = self._ref(service)
+        args = self._kubectl + ["exec", "-c", container]
+        args += (["-i"] if stdin is not None else []) + [ref, "--"] + cmd
+        return self._run(args, stdin=stdin, timeout=timeout)
+
+    def _ensure_namespace(self):
+        r = self._run(self._kubectl_base + ["get", "namespace", self.ns])
+        if r.returncode != 0:
+            self._run(self._kubectl_base + ["create", "namespace", self.ns])
+
+    def _ensure_secret(self):
+        # Apply the Secret via stdin so values never appear in argv (R8).
+        lines = ["apiVersion: v1", "kind: Secret",
+                 "metadata:", "  name: %s-secret" % self.rel,
+                 "  namespace: %s" % self.ns, "type: Opaque", "stringData:"]
+        for k in self.SECRET_KEYS:
+            lines.append("  %s: %s" % (k, json.dumps(self.env.get(k, ""))))
+        return self._run(self._kubectl + ["apply", "-f", "-"],
+                         stdin="\n".join(lines) + "\n")
+
+    def up(self):
+        # helm is declarative + idempotent: install or converge in one call.
+        self._ensure_namespace()
+        s = self._ensure_secret()
+        if s.returncode != 0:
+            return s
+        args = self._helm + ["upgrade", "--install", self.rel,
+            os.path.join(self.dir, self.chart),
+            "--set", "secret.existingSecret=%s-secret" % self.rel]
+        manifest = os.path.join(self.dir, "hub.yml")
+        if os.path.isfile(manifest):
+            args += ["--set-file", "hubManifest=" + manifest]
+        img = self.env.get("HUB_IMAGE", "")
+        if img:
+            repo, _, tag = img.partition(":")
+            args += ["--set-string", "image.repository=" + repo,
+                     "--set-string", "image.tag=" + (tag or "latest")]
+        for k in self.ENV_KEYS:
+            if self.env.get(k):
+                args += ["--set-string", "env.%s=%s" % (k, self.env[k])]
+        b = self.backup
+        if str(b.get("enabled", "")).lower() in ("1", "true", "yes"):
+            args += ["--set", "backup.enabled=true"]
+            if b.get("schedule"):
+                args += ["--set-string", "backup.schedule=" + str(b["schedule"])]
+            if b.get("keep"):
+                args += ["--set", "backup.keep=" + str(b["keep"])]
+        if self.ingress_host:
+            args += ["--set", "ingress.enabled=true",
+                     "--set-string", "ingress.host=" + self.ingress_host]
+        args += ["--wait", "--timeout", "20m"]
+        return self._run(args)
+
+    def down(self, volumes=False):
+        r = self._run(self._helm + ["uninstall", self.rel])
+        if volumes:
+            # PVCs from a StatefulSet/Deployment are not GC'd by helm uninstall.
+            self._run(self._kubectl + ["delete", "pvc", "-l",
+                      "app.kubernetes.io/instance=" + self.rel])
+        return r
+
+    def logs(self, service=None, tail=None, follow=False):
+        ref, container = self._ref(service or "web")
+        args = self._kubectl + ["logs", ref, "-c", container]
+        if tail:
+            args += ["--tail", str(tail)]
+        if follow:
+            args += ["-f"]
+            return self._run(args, capture=False)
+        return self._run(args)
+
+    def status(self):
+        r = self._run(self._kubectl + ["get", "pods", "-l",
+                      "app.kubernetes.io/instance=" + self.rel, "-o", "json"])
+        services = []
+        try:
+            pods = json.loads(r.stdout or "{}").get("items", [])
+        except json.JSONDecodeError:
+            return services
+        for p in pods:
+            name = p.get("metadata", {}).get("labels", {}).get(
+                "app.kubernetes.io/component") or p.get("metadata", {}).get("name", "")
+            phase = p.get("status", {}).get("phase", "")
+            conds = {c["type"]: c["status"] for c in p.get("status", {}).get("conditions", [])}
+            ready = conds.get("Ready") == "True"
+            services.append({"service": name, "state": "running" if phase == "Running" else phase,
+                             "health": "healthy" if ready else "not-ready"})
+        return services
+
+    def restart(self, service):
+        ref, _ = self._ref(service)
+        return self._run(self._kubectl + ["rollout", "restart", ref])
+
+    def shell(self, service, cmd):
+        ref, container = self._ref(service)
+        return subprocess.run(self._kubectl + ["exec", "-it", "-c", container, ref, "--"] + cmd,
+                              cwd=self.dir)
+
+    def stream_to_file(self, service, cmd, path):
+        ref, container = self._ref(service)
+        args = self._kubectl + ["exec", "-c", container, ref, "--"] + cmd
+        with open(path, "wb") as out:
+            r = subprocess.run(args, cwd=self.dir, stdout=out, stderr=subprocess.PIPE)
+        return subprocess.CompletedProcess(r.args, r.returncode, "",
+                                           r.stderr.decode("utf-8", "replace"))
+
+    def stream_from_file(self, service, cmd, path):
+        ref, container = self._ref(service)
+        args = self._kubectl + ["exec", "-i", "-c", container, ref, "--"] + cmd
+        with open(path, "rb") as src:
+            r = subprocess.run(args, cwd=self.dir, stdin=src, capture_output=True)
+        return subprocess.CompletedProcess(r.args, r.returncode,
+            r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace"))
+
+    def target_id(self):
+        context = self.context
+        if not context:
+            r = self._run(self._kubectl_base + ["config", "current-context"])
+            context = (r.stdout or "").strip() or "<unknown-context>"
+        return "kubernetes:%s:%s:%s" % (context, self.ns, self.rel)
+
+    def url(self):
+        if self.ingress_host:
+            return "https://" + self.ingress_host
+        return "https://<%s-web service>" % self.rel
+
+
+def get_driver(project_dir, env, dev=False):
+    cfg = read_autohub_config(project_dir)
+    driver = cfg.get("driver", "docker")
+    if driver == "kubernetes":
+        return KubernetesDriver(project_dir, env, cfg)
+    return DockerDriver(project_dir, env, dev=dev)
+
+
+# ---------------------------------------------------------------------------
+# result + output contract
+# ---------------------------------------------------------------------------
+
+class Result:
+    def __init__(self, action):
+        self.action = action
+        self.ok = True
+        self.details = []          # human-readable lines
+        self.checks = []           # {name, ok, info}
+        self.next = []             # suggested follow-up commands
+        self.verify_failed = False
+
+    def say(self, line):
+        self.details.append(scrub(line))
+
+    def check(self, name, ok, info=""):
+        self.checks.append({"name": name, "ok": bool(ok), "info": scrub(str(info))})
+        if not ok:
+            self.verify_failed = True
+        return ok
+
+    def fail(self, line):
+        self.ok = False
+        self.say(line)
+
+    def suggest(self, cmd):
+        if cmd not in self.next:
+            self.next.append(cmd)
+
+    def exit_code(self):
+        if not self.ok:
+            return 1
+        if self.verify_failed:
+            return 2
+        return 0
+
+    def emit(self, as_json):
+        if as_json:
+            print(json.dumps({
+                "ok": self.ok and not self.verify_failed,
+                "action": self.action,
+                "details": self.details,
+                "checks": self.checks,
+                "next": self.next,
+            }, indent=2))
+        else:
+            for d in self.details:
+                print(d)
+            for c in self.checks:
+                mark = "ok " if c["ok"] else "FAIL"
+                info = ("  " + c["info"]) if c["info"] else ""
+                print("  [%s] %s%s" % (mark, c["name"], info))
+            if self.next:
+                print("next:")
+                for n in self.next:
+                    print("  " + n)
+        return self.exit_code()
+
+
+# ---------------------------------------------------------------------------
+# http helpers (self-signed TLS — verification off on purpose)
+# ---------------------------------------------------------------------------
+
+def http_get(url, timeout=20, headers=None):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(url, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            return r.status, r.read(), dict(r.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read() if e.fp else b"", dict(e.headers or {})
+    except Exception as e:
+        return 0, str(e).encode(), {}
+
+
+# ---------------------------------------------------------------------------
+# durable snapshots + destructive-operation guards
+# ---------------------------------------------------------------------------
+
+def _utc_stamp():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _require_destructive_confirmation(drv, args, res, operation):
+    target = drv.target_id()
+    if not getattr(args, "force", False):
+        res.fail("refusing to %s without --force" % operation)
+        return False
+    if getattr(args, "confirm", None) != target:
+        res.fail("refusing to %s: pass --confirm %s" % (operation, target))
+        res.say("resolved target: " + target)
+        return False
+    return True
+
+
+def _stream_database_dump(drv, path):
+    return drv.stream_to_file("web", ["bash", "-c",
+        "set -o pipefail; hub-backup - | gzip -9"], path)
+
+
+def _create_snapshot(drv, env, res, label="snapshot"):
+    """Create a host-side, full-state recovery point for either driver."""
+    safe_label = re.sub(r"[^a-zA-Z0-9._-]+", "-", label).strip("-.") or "snapshot"
+    root = os.path.join(drv.dir, "backups")
+    base = os.path.join(root, "%s-%s" % (_utc_stamp(), safe_label))
+    dest = base
+    suffix = 1
+    while os.path.exists(dest):
+        dest = "%s-%d" % (base, suffix)
+        suffix += 1
+    os.makedirs(dest, mode=0o700)
+    os.chmod(dest, 0o700)
+
+    metadata = {
+        "format": 1,
+        "complete": False,
+        "created_utc": _utc_stamp(),
+        "target": drv.target_id(),
+        "driver": drv.name,
+        "files": {},
+    }
+    meta_path = os.path.join(dest, "metadata.json")
+
+    source = drv.exec("web", ["git", "-C", "/var/www/html", "rev-parse", "HEAD"])
+    if source.returncode == 0:
+        metadata["source_commit"] = (source.stdout or "").strip()
+
+    artifacts = [
+        ("database.sql.gz", "web", ["bash", "-c",
+            "set -o pipefail; hub-backup - | gzip -9"]),
+        ("hub_app.tar.gz", "web", ["bash", "-c",
+            "set -o pipefail; tar -czf - --exclude=app/backups --exclude=app/cache "
+            "--exclude=app/logs --exclude=app/sessions -C \"$HUB_ROOT\" app"]),
+        ("hub_tls.tar.gz", "web", ["bash", "-c",
+            "set -o pipefail; if [ -d /etc/hubzero/tls ]; then "
+            "tar -czf - -C /etc/hubzero tls; else tar -czf - --files-from /dev/null; fi"]),
+    ]
+    for filename, service, command in artifacts:
+        path = os.path.join(dest, filename)
+        r = drv.stream_to_file(service, command, path)
+        if r.returncode != 0:
+            metadata["error"] = "%s failed: %s" % (filename, scrub(r.stderr).strip())
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2, sort_keys=True)
+            res.fail("snapshot failed while creating %s; partial files kept at %s" %
+                     (filename, dest))
+            return None
+        metadata["files"][filename] = {
+            "bytes": os.path.getsize(path),
+            "sha256": _sha256(path),
+        }
+
+    project = os.path.join(dest, "project")
+    os.makedirs(project, mode=0o700)
+    for filename in (".env", "hub.yml", "autohub.yml"):
+        src = os.path.join(drv.dir, filename)
+        if os.path.isfile(src):
+            dst = os.path.join(project, filename)
+            shutil.copy2(src, dst)
+            os.chmod(dst, 0o600)
+            rel = "project/" + filename
+            metadata["files"][rel] = {
+                "bytes": os.path.getsize(dst),
+                "sha256": _sha256(dst),
+            }
+
+    metadata["complete"] = True
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
+    os.chmod(meta_path, 0o600)
+    res.say("snapshot written outside managed volumes: " + dest)
+    res.check("full-state snapshot", True,
+              "database + hub_app + TLS + project configuration")
+    return dest
+
+
+def _load_snapshot(path, res):
+    path = os.path.realpath(path)
+    meta_path = os.path.join(path, "metadata.json")
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            metadata = json.load(f)
+    except (OSError, ValueError) as e:
+        res.fail("invalid snapshot metadata: %s" % e)
+        return None, None
+    if not metadata.get("complete"):
+        res.fail("refusing to restore an incomplete snapshot: " + path)
+        return None, None
+    required = {"database.sql.gz", "hub_app.tar.gz", "hub_tls.tar.gz"}
+    if not required.issubset(metadata.get("files", {})):
+        res.fail("snapshot is missing required full-state artifacts")
+        return None, None
+    for filename, expected in metadata.get("files", {}).items():
+        artifact = os.path.realpath(os.path.join(path, filename))
+        if os.path.commonpath([path, artifact]) != path:
+            res.fail("snapshot contains an unsafe path: " + filename)
+            return None, None
+        if not os.path.isfile(artifact) or _sha256(artifact) != expected.get("sha256"):
+            res.fail("snapshot integrity check failed: " + filename)
+            return None, None
+    return path, metadata
+
+
+def _restore_snapshot(drv, path, metadata, res):
+    source_commit = metadata.get("source_commit")
+    if source_commit:
+        r = drv.exec("web", ["bash", "-c",
+            'set -e; HUBZERO_REF="$1" hub-source-sync --update; hub-composer; hub-config-render',
+            "_", source_commit])
+        if r.returncode != 0:
+            res.fail("source rollback failed: " + scrub(r.stderr or r.stdout).strip())
+            return False
+
+    app = drv.stream_from_file("web", ["bash", "-c",
+        'set -e; find "$HUB_ROOT/app" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; '
+        'tar -xzf - -C "$HUB_ROOT"; chown -R "$HUB_USER:$HUB_USER" "$HUB_ROOT/app"'],
+        os.path.join(path, "hub_app.tar.gz"))
+    if app.returncode != 0:
+        res.fail("hub_app restore failed: " + scrub(app.stderr).strip())
+        return False
+
+    tls = drv.stream_from_file("web", ["bash", "-c",
+        'set -e; rm -rf /etc/hubzero/tls; tar -xzf - -C /etc/hubzero'],
+        os.path.join(path, "hub_tls.tar.gz"))
+    if tls.returncode != 0:
+        res.fail("TLS restore failed: " + scrub(tls.stderr).strip())
+        return False
+
+    database = drv.stream_from_file("db", ["sh", "-c",
+        'set -e; gzip -dc | exec mariadb -u"$MARIADB_USER" '
+        '-p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"'],
+        os.path.join(path, "database.sql.gz"))
+    if database.returncode != 0:
+        res.fail("database restore failed: " + scrub(database.stderr).strip())
+        return False
+
+    restarted = drv.restart("web")
+    if restarted.returncode != 0:
+        res.fail("state restored but web restart failed: " + scrub(restarted.stderr).strip())
+        return False
+    res.check("full-state restore", True, os.path.basename(path))
+    res.say("saved project configuration is under %s/project; review it rather than overwriting live files blindly" % path)
+    res.suggest("cli/autohub verify --json")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+def cmd_init(drv, env, args, res):
+    replacing = args.force and any(os.path.exists(os.path.join(drv.dir, name))
+                                   for name in (".env", "hub.yml"))
+    if replacing and not _require_destructive_confirmation(
+            drv, args, res, "replace existing .env/hub.yml"):
+        return res
+    cmd = [os.path.join(drv.dir, "scripts", "hub-init.sh")]
+    for flag, val in (("--site", args.site), ("--preset", args.preset),
+                      ("--template-url", args.template_url)):
+        if val:
+            cmd += [flag, val]
+    if args.force:
+        cmd += ["--force"]
+    r = subprocess.run(cmd, cwd=drv.dir, capture_output=True, text=True)
+    res.say(scrub(r.stdout.strip()))
+    if r.returncode != 0:
+        res.fail(scrub(r.stderr.strip()))
+    else:
+        res.suggest("cli/autohub up --wait --json")
+    return res
+
+
+def cmd_up(drv, env, args, res):
+    r = drv.up()
+    # up() may fail (helm error, bad compose). Surface it — the k8s path in
+    # particular returns non-zero without printing to our stream.
+    if r is not None and getattr(r, "returncode", 0) != 0:
+        res.fail("start failed: " + scrub(((r.stderr or "") or (r.stdout or "")).strip()
+                                          or "see output above"))
+        return res
+    res.say("stack starting")
+    if args.wait:
+        res.say("waiting for first-boot completion (this can take several minutes)")
+        deadline = time.time() + args.timeout
+        status = "timeout"
+        while time.time() < deadline:
+            r = drv.logs(service="web", tail=400)
+            out = (r.stdout or "") + (r.stderr or "")
+            if re.search(r"\[hub\] ERROR", out):
+                status = "error"
+                break
+            if "bootstrap complete" in out:
+                status = "ready"
+                break
+            time.sleep(10)
+        if status == "ready":
+            res.say("bootstrap complete")
+            res.suggest("cli/autohub verify --json")
+        elif status == "error":
+            res.fail("bootstrap reported [hub] ERROR — see: autohub logs --errors")
+        else:
+            res.fail("timed out after %ss waiting for bootstrap" % args.timeout)
+    else:
+        res.suggest("cli/autohub up --wait --json")
+        res.suggest("cli/autohub verify --json")
+    return res
+
+
+def cmd_down(drv, env, args, res):
+    drv.down(volumes=False)
+    res.say("stack stopped (data kept)")
+    return res
+
+
+def cmd_destroy(drv, env, args, res):
+    if not _require_destructive_confirmation(drv, args, res,
+                                             "delete all managed volumes"):
+        return res
+    if not args.snapshot:
+        res.fail("refusing to destroy without --snapshot <full-state-snapshot-dir>")
+        return res
+    snapshot, metadata = _load_snapshot(args.snapshot, res)
+    if not snapshot:
+        return res
+    if metadata.get("target") != drv.target_id():
+        res.fail("snapshot target does not match the resolved destroy target")
+        return res
+    r = drv.down(volumes=True)
+    if r.returncode != 0:
+        res.fail("destroy failed: " + scrub(r.stderr or r.stdout).strip())
+        return res
+    res.say("stack destroyed: all managed volumes/PVCs deleted, including source, app data, database, TLS and in-cluster backups")
+    res.say("recovery snapshot retained on the host: " + snapshot)
+    res.suggest("cli/autohub up --wait --json")
+    return res
+
+
+def cmd_status(drv, env, args, res):
+    res.say("target: %s" % drv.target_id())
+    services = drv.status()
+    if not services:
+        res.say("no services running")
+        res.suggest("cli/autohub up --wait --json")
+        return res
+    for s in services:
+        res.check("service:%s" % s["service"],
+                  s["state"] == "running",
+                  s["health"] or s["state"])
+    res.say("url: %s" % drv.url())
+    return res
+
+
+def cmd_provision(drv, env, args, res):
+    r = drv.exec("web", ["hub-provision"])
+    out = scrub((r.stdout or "") + (r.stderr or ""))
+    for line in out.splitlines():
+        if line.strip():
+            res.say(line)
+    m = re.search(r"provisioning complete: (\d+) applied, (\d+) failed", out)
+    if m:
+        res.check("provision", m.group(2) == "0",
+                  "%s applied, %s failed" % m.groups())
+    elif r.returncode != 0:
+        res.fail("provisioning failed")
+    res.suggest("cli/autohub verify --json")
+    return res
+
+
+def cmd_assets(drv, env, args, res):
+    # hub-assets [--clean]: no arg = compile only; --clean = clear then recompile
+    cmd = ["hub-assets"] + (["--clean"] if args.sub == "clean" else [])
+    r = drv.exec("web", cmd)
+    out = (r.stdout or "") + (r.stderr or "")
+    for line in out.splitlines():
+        if line.strip():
+            res.say(line)
+    failed = "FAILED" in out or r.returncode != 0
+    res.check("assets compile", not failed)
+    if failed:
+        res.say("fix the LESS error above; the site serves UNSTYLED until it compiles")
+    return res
+
+
+def cmd_cache(drv, env, args, res):
+    # `muse cache clear` removes app/cache/* (the per-client dirs incl. site.css).
+    # NOT `cache css clear`, which targets the wrong path (DESIGN.md R6).
+    # hub-muse runs muse as www-data from HUB_ROOT — don't hardcode either.
+    r = drv.exec("web", ["hub-muse", "cache", "clear"])
+    out = (r.stdout or "") + (r.stderr or "")
+    res.say(re.sub(r"\x1b\[[0-9;]*m", "", out).strip() or "cache cleared")
+    if args.warm:
+        code, _, _ = http_get(drv.url() + "/")
+        res.check("cache warmed (homepage recompiles site.css)", code == 200,
+                  "HTTP %s" % code)
+    else:
+        res.suggest("cli/autohub cache clear --warm --json")
+    return res
+
+
+ASSET_LINK_RE = re.compile(r'(?:href|src)="([^"]+\.(?:css|js)[^"]*)"')
+
+def cmd_verify(drv, env, args, res):
+    base = drv.url()
+    scope = args.scope
+
+    if scope in ("all", "site"):
+        for path, want in [("/", 200), ("/administrator/", 200)]:
+            code, _, _ = http_get(base + path)
+            res.check("GET %s" % path, code == want, "HTTP %s" % code)
+
+    if scope in ("all", "assets"):
+        code, body, _ = http_get(base + "/app/cache/site/site.css")
+        big_enough = code == 200 and len(body) > 10000
+        res.check("compiled site.css", big_enough,
+                  "HTTP %s, %d bytes" % (code, len(body)))
+        if not big_enough:
+            res.suggest("cli/autohub assets build --json")
+        code, _, _ = http_get(base + "/app/config/database.php")
+        res.check("config is denied", code == 403, "HTTP %s (want 403)" % code)
+        # sweep: every css/js the homepage links must resolve
+        code, body, _ = http_get(base + "/")
+        if code == 200:
+            links = sorted(set(ASSET_LINK_RE.findall(body.decode("utf-8", "replace"))))
+            bad = []
+            for link in links:
+                if link.startswith("http"):
+                    continue
+                c, _, _ = http_get(base + link)
+                if c != 200:
+                    bad.append("%s -> %s" % (link, c))
+            res.check("homepage asset sweep (%d links)" % len(links),
+                      not bad, "; ".join(bad[:5]))
+
+    if scope in ("all", "mail"):
+        r = drv.exec("web", ["bash", "-c",
+                     "getent hosts \"$HUB_SMTP_HOST\" >/dev/null 2>&1 && "
+                     "(exec 3<>/dev/tcp/$HUB_SMTP_HOST/$HUB_SMTP_PORT) 2>/dev/null "
+                     "&& echo reachable || echo unreachable"])
+        okmail = "reachable" == (r.stdout or "").strip()
+        res.check("smtp reachable", okmail, (r.stdout or "").strip())
+        if not okmail:
+            res.say("mail failures cause 500s on core actions (group save etc.)")
+
+    if scope in ("all", "login"):
+        user = env.get("HUB_ADMIN_USER")
+        pw = env.get("HUB_ADMIN_PASSWORD")
+        if user and pw:
+            res.check("admin login", _try_admin_login(base, user, pw))
+        else:
+            res.check("admin login", False,
+                      "not run: HUB_ADMIN_USER/PASSWORD missing from .env")
+
+    if scope in ("all", "db"):
+        r = drv.exec("web", ["bash", "-c",
+                     "gosu www-data php /usr/local/lib/hubzero/bootstrap-cli.php "
+                     ">/dev/null 2>&1 && echo ok || echo fail"])
+        res.check("app bootstrap (db reachable, config sane)",
+                  "ok" == (r.stdout or "").strip())
+
+    return res
+
+
+def _try_admin_login(base, user, pw):
+    """End-to-end /administrator login with the CSRF token dance."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    import http.cookiejar
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ctx),
+        urllib.request.HTTPCookieProcessor(jar))
+    try:
+        page = opener.open(base + "/administrator/index.php", timeout=25).read().decode("utf-8", "replace")
+        m = re.search(r'name="([a-f0-9]{32})" value="1"', page)
+        if not m:
+            return False
+        data = urllib.parse.urlencode({
+            "username": user, "passwd": pw,
+            "option": "com_login", "task": "login", m.group(1): "1",
+        }).encode()
+        opener.open(base + "/administrator/index.php", data=data, timeout=25)
+        after = opener.open(base + "/administrator/index.php", timeout=25).read().decode("utf-8", "replace")
+        return "task=logout" in after or "Log out" in after
+    except Exception:
+        return False
+
+
+# doctor: log pattern -> known cause (seeded from the spin-hub troubleshooting
+# table plus failures diagnosed while testing real HUBzero deployments)
+DOCTOR_PATTERNS = [
+    (r"getaddrinfo for mail failed|Connection could not be established with host",
+     "SMTP unreachable — email actions 500. The base stack ships mailpit; is the `mail` service up? (autohub status)"),
+    (r"member function get\(\) on null.*tickets\.php",
+     "com_support core query folders missing — run `autohub provision` (seeds them)"),
+    (r"Class \"[^\"]+Helpers[^\"]+\" not found",
+     "component helper referenced without include_once — CMS-side bug; check the component's controller"),
+    (r"E_HUBZERO_USER_PLUGIN_FAILED",
+     "plg_user_hubzero unregistered — re-run `autohub provision` (db repair)"),
+    (r"invalid_token|The access token provided is invalid",
+     "First-party API calls (course editor, tool sessions) 401 — the internal OAuth client "
+     "(#__developer_applications hub_account=1) is missing; its CMS self-heal fails on localhost "
+     "hosts (redirect_uri has no TLD). Run `autohub provision` (seeds it)."),
+    (r"Unknown column|doesn't exist.*jos_",
+     "schema behind migrations — run `autohub migrate`"),
+    (r"lessc|ParseError|unrecognised input",
+     "LESS syntax error — `autohub assets build` shows file and line; site serves unstyled until fixed"),
+    (r"header field exceeds server limit",
+     "HUBzero cookie load exceeds Apache header limit — image sets LimitRequestFieldSize 32768; rebuild if this appears"),
+    (r"HTTP Basic: Access denied",
+     "git credential rejected — token expired/rotated; update .env, never bake tokens into remotes"),
+    (r"blocked due to MIME type|X-Content-Type-Options",
+     "an asset URL returns HTML (403/404 routed to index) — find it with `autohub verify --scope assets`"),
+]
+
+def cmd_doctor(drv, env, args, res):
+    r = drv.logs(service="web", tail=args.tail)
+    out = (r.stdout or "") + (r.stderr or "")
+    found = 0
+    for pat, advice in DOCTOR_PATTERNS:
+        hits = re.findall(pat, out)
+        if hits:
+            found += 1
+            res.check("pattern: %s" % pat[:48], False, advice)
+    if not found:
+        res.say("no known failure patterns in the last %d log lines" % args.tail)
+    res.suggest("cli/autohub verify --json")
+    if found:
+        res.suggest("cli/autohub logs --errors --json")
+    return res
+
+
+def cmd_logs(drv, env, args, res):
+    if args.follow:
+        if getattr(args, "json", False):
+            res.fail("--json cannot be combined with streaming --follow")
+            return res
+        drv.logs(service="web", follow=True)
+        return res
+    r = drv.logs(service="web", tail=args.tail)
+    out = (r.stdout or "") + (r.stderr or "")
+    if args.errors:
+        # cms.ERROR lines carry the full stack trace in one (huge) line
+        lines = [l for l in out.splitlines()
+                 if re.search(r"cms\.ERROR|PHP Fatal|\[hub\] ERROR", l)]
+        out = "\n".join(lines[-args.limit:]) if lines else "no error lines found"
+    out = scrub(out)
+    if getattr(args, "json", False):
+        for line in out.splitlines():
+            res.say(line)
+    else:
+        print(out)
+    return res
+
+
+def cmd_db(drv, env, args, res):
+    if args.sub == "query":
+        sql = args.arg
+        if not sql:
+            res.fail("query needs SQL: autohub db query \"SELECT ...\"")
+            return res
+        r = drv.exec("db", ["sh", "-c",
+            'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" "$MARIADB_DATABASE" -t -e "$1"',
+            "_", sql])
+        out = scrub(r.stdout or "")
+        if getattr(args, "json", False):
+            for line in out.splitlines():
+                res.say(line)
+        else:
+            print(out)
+        if r.returncode != 0:
+            res.fail(scrub(r.stderr or "query failed"))
+    elif args.sub == "dump":
+        os.makedirs(os.path.join(drv.dir, "backups"), exist_ok=True)
+        path = os.path.join(drv.dir, "backups", "db-%s.sql.gz" % _utc_stamp())
+        r = _stream_database_dump(drv, path)
+        if r.returncode == 0:
+            os.chmod(path, 0o600)
+            res.say("database dump written outside managed volumes: " + path)
+        else:
+            res.fail(scrub(r.stderr or "database dump failed"))
+        res.check("backup", r.returncode == 0)
+    elif args.sub == "restore":
+        path = args.arg
+        if not path or not os.path.isfile(path):
+            res.fail("restore needs a readable dump file: autohub db restore <file.sql[.gz]>")
+            return res
+        if not _require_destructive_confirmation(drv, args, res,
+                                                 "overwrite the live database"):
+            return res
+        command = ('gzip -dc | exec mariadb -u"$MARIADB_USER" '
+                   '-p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"') if path.endswith(".gz") else (
+                   'exec mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"')
+        r = drv.stream_from_file("db", ["sh", "-c", command], path)
+        res.check("restore", r.returncode == 0, os.path.basename(path))
+        if r.returncode != 0:
+            res.fail(scrub(r.stderr or "restore failed"))
+        else:
+            res.suggest("cli/autohub verify --json")
+    elif args.sub == "shell":
+        if getattr(args, "json", False):
+            res.fail("--json cannot be combined with the interactive database shell")
+            return res
+        drv.shell("db", ["sh", "-c",
+            'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" "$MARIADB_DATABASE"'])
+    return res
+
+
+def cmd_backup(drv, env, args, res):
+    if args.sub == "create":
+        _create_snapshot(drv, env, res, label=args.label or "snapshot")
+        return res
+
+    if not args.path:
+        res.fail("restore needs a snapshot directory")
+        return res
+    if not _require_destructive_confirmation(drv, args, res,
+                                             "restore full hub state"):
+        return res
+    path, metadata = _load_snapshot(args.path, res)
+    if path:
+        _restore_snapshot(drv, path, metadata, res)
+    return res
+
+
+def cmd_migrate(drv, env, args, res):
+    r = drv.exec("web", ["hub-migrate"])
+    res.say(scrub((r.stdout or "") + (r.stderr or "")).strip())
+    res.check("migrations", r.returncode == 0)
+    return res
+
+
+def cmd_ext(drv, env, args, res):
+    if args.sub == "list":
+        r = drv.exec("db", ["sh", "-c",
+            'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" "$MARIADB_DATABASE" -N -e '
+            '"SELECT type, element, enabled FROM jos_extensions '
+            'WHERE type IN (\'component\',\'module\',\'plugin\',\'template\') '
+            'ORDER BY type, element;"'])
+        out = scrub(r.stdout or "")
+        if getattr(args, "json", False):
+            for line in out.splitlines():
+                res.say(line)
+        else:
+            print(out)
+    else:
+        res.say("install/enable/disable land in hub.yml (extensions:), then `autohub provision` —")
+        res.say("provisioning clones, registers AND runs the extension's migrations (DESIGN.md R4)")
+        res.suggest("cli/autohub provision --json")
+    return res
+
+
+def cmd_admin(drv, env, args, res):
+    if not env.get("HUB_ADMIN_PASSWORD"):
+        res.fail("HUB_ADMIN_PASSWORD is missing from .env; do not pass passwords in argv")
+        return res
+    r = drv.exec("web", ["hub-admin", args.user])
+    res.say(scrub((r.stdout or r.stderr or "").strip()))
+    res.check("admin account", r.returncode == 0, args.user)
+    return res
+
+
+TEMPLATES_DIR = "/var/www/html/app/templates"
+
+def _resolve_template(drv, name):
+    if name:
+        return name
+    r = drv.exec("web", ["bash", "-c",
+        'for d in %s/*/; do [ -d "$d/.git" ] && basename "$d"; done' % TEMPLATES_DIR])
+    names = [n for n in (r.stdout or "").split() if n]
+    if len(names) == 1:
+        return names[0]
+    raise Exception("pass --name; found %d template git repos: %s"
+                    % (len(names), ", ".join(names) or "none"))
+
+
+def cmd_template(drv, env, args, res):
+    if args.name and not re.fullmatch(r"[A-Za-z0-9._-]+", args.name):
+        res.fail("template name may contain only letters, digits, dot, underscore and hyphen")
+        return res
+    if args.branch and (args.branch.startswith("-") or ".." in args.branch or
+                        not re.fullmatch(r"[A-Za-z0-9._/-]+", args.branch)):
+        res.fail("unsafe git branch name")
+        return res
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.token_env):
+        res.fail("token environment variable name is invalid")
+        return res
+    name = _resolve_template(drv, args.name)
+    tpl = TEMPLATES_DIR + "/" + name
+
+    if args.sub == "status":
+        script = "\n".join([
+            "cd " + tpl,
+            'echo "template: %s"' % name,
+            'echo "branch:   $(git rev-parse --abbrev-ref HEAD)"',
+            # never print an embedded token if some remote has one
+            'echo "remote:   $(git remote get-url origin | sed -E \'s#oauth2:[^@]+@#oauth2:***@#\')"',
+            'echo "ahead/behind (HEAD vs upstream): $(git rev-list --left-right --count @{u}...HEAD 2>/dev/null || echo n/a)"',
+            'echo "uncommitted files: $(git status --porcelain | wc -l | tr -d \" \")"',
+        ])
+        r = drv.exec("web", ["bash", "-c", script])
+        for line in scrub(r.stdout or "").splitlines():
+            res.say(line)
+        res.check("template repo readable", r.returncode == 0, name)
+        return res
+
+    if args.sub == "push":
+        tokenenv = args.token_env
+        force = "--force-with-lease" if args.force else ""
+        branch = args.branch or "$(git rev-parse --abbrev-ref HEAD)"
+        # Token hygiene (R8): it lives only in the container env var $tokenenv
+        # (from .env). We normalise the URL to embed the *username* `oauth2`
+        # (not a secret) so git prompts only for the password, which GIT_ASKPASS
+        # supplies from $GITTOK. The token never touches argv, the askpass file,
+        # or .git/config; the stored remote stays tokenless.
+        script = "\n".join([
+            "cd " + tpl + " || exit 1",
+            ': "${%s:?%s is not set in the container environment (.env)}"' % (tokenenv, tokenenv),
+            "BR=" + branch,
+            "URL=$(git remote get-url origin | sed -E 's#https://([^@]*@)?#https://oauth2@#')",
+            "AP=$(mktemp)",
+            'trap \'rm -f "$AP"\' EXIT',   # remove the askpass file on any exit path
+            "printf '#!/bin/sh\\necho \"$GITTOK\"\\n' > \"$AP\"",
+            "chmod +x \"$AP\"",
+            # exit status is git push's (the last command)
+            'GITTOK="$%s" GIT_ASKPASS="$AP" git push %s "$URL" "$BR" 2>&1' % (tokenenv, force),
+        ])
+        r = drv.exec("web", ["bash", "-c", script])
+        for line in scrub(r.stdout or "").splitlines():
+            if line.strip():
+                res.say(line)
+        res.check("template push (%s)" % name, r.returncode == 0, name)
+        if r.returncode == 0:
+            res.suggest("cli/autohub assets build --json")
+        return res
+
+    return res
+
+
+def cmd_update(drv, env, args, res):
+    # Safety: snapshot all persistent state before source + schema changes.
+    if args.no_backup and args.confirm != drv.target_id():
+        res.fail("refusing an update without backup: pass --confirm %s" % drv.target_id())
+        return res
+    if not args.no_backup:
+        snapshot = _create_snapshot(drv, env, res, label="pre-update")
+        if not snapshot:
+            res.fail("pre-update full-state snapshot failed; refusing to update")
+            return res
+    cmd = ["hub-update"] + ([args.ref] if args.ref else [])
+    r = drv.exec("web", cmd)
+    res.say(scrub((r.stdout or "") + (r.stderr or "")).strip())
+    res.check("update", r.returncode == 0)
+    if r.returncode == 0:
+        drv.restart("web")
+        res.say("web restarted")
+        res.suggest("cli/autohub verify --json")
+    else:
+        res.say("restore the coordinated pre-update snapshot with `autohub backup restore <dir> --force --confirm <target>`")
+    return res
+
+
+def cmd_muse(drv, env, args, res):
+    r = drv.exec("web", ["hub-muse"] + args.args)
+    out = scrub(re.sub(r"\x1b\[[0-9;]*m", "", (r.stdout or "") + (r.stderr or "")))
+    if getattr(args, "json", False):
+        for line in out.splitlines():
+            res.say(line)
+    else:
+        print(out)
+    if r.returncode != 0:
+        res.fail("muse exited %d" % r.returncode)
+    return res
+
+
+# ---------------------------------------------------------------------------
+# argument parsing
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    # Global flags live on a shared parent so they work in BOTH positions
+    # (`autohub --json status` and `autohub status --json`). SUPPRESS defaults
+    # keep a subparser from clobbering a value the parent already set.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="machine-readable output")
+    common.add_argument("--project-dir", default=argparse.SUPPRESS,
+                        help="project root (default: auto-detect)")
+    common.add_argument("--dev", action="store_true", default=argparse.SUPPRESS,
+                        help="use the dev compose overlay")
+
+    p = argparse.ArgumentParser(prog="autohub", parents=[common],
+        description="Create and maintain a HUBzero hub (see DESIGN.md)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, **kw):
+        return sub.add_parser(name, parents=[common], **kw)
+
+    s = add("init", help="scaffold .env + hub.yml")
+    s.add_argument("--site"); s.add_argument("--preset")
+    s.add_argument("--template-url"); s.add_argument("--force", action="store_true")
+    s.add_argument("--confirm", help="exact target id required when --force replaces existing files")
+    s.set_defaults(fn=cmd_init)
+
+    s = add("up", help="start the stack")
+    s.add_argument("--wait", action="store_true", help="block until first boot completes")
+    s.add_argument("--timeout", type=int, default=900)
+    s.set_defaults(fn=cmd_up)
+
+    add("down", help="stop, keep data").set_defaults(fn=cmd_down)
+
+    s = add("destroy", help="stop and DELETE all volumes")
+    s.add_argument("--force", action="store_true")
+    s.add_argument("--confirm", help="exact target id printed by `autohub status`")
+    s.add_argument("--snapshot", help="validated full-state snapshot required before deletion")
+    s.set_defaults(fn=cmd_destroy)
+
+    add("status", help="service state + url").set_defaults(fn=cmd_status)
+    add("provision", help="apply hub.yml").set_defaults(fn=cmd_provision)
+
+    s = add("assets", help="template asset pipeline")
+    s.add_argument("sub", choices=["build", "clean"], nargs="?", default="build")
+    s.set_defaults(fn=cmd_assets)
+
+    s = add("cache", help="compiled-css / cms cache")
+    s.add_argument("sub", choices=["clear"])
+    s.add_argument("--warm", action="store_true", help="request the homepage after clearing")
+    s.set_defaults(fn=cmd_cache)
+
+    s = add("verify", help="prove the hub actually works")
+    s.add_argument("--scope", default="all",
+                   choices=["all", "site", "assets", "mail", "login", "db"])
+    s.set_defaults(fn=cmd_verify)
+
+    s = add("doctor", help="match recent logs against known failures")
+    s.add_argument("--tail", type=int, default=400)
+    s.set_defaults(fn=cmd_doctor)
+
+    s = add("logs", help="web logs")
+    s.add_argument("--errors", action="store_true", help="only error lines")
+    s.add_argument("--tail", type=int, default=300)
+    s.add_argument("--limit", type=int, default=10)
+    s.add_argument("--follow", action="store_true")
+    s.set_defaults(fn=cmd_logs)
+
+    s = add("db", help="database access")
+    s.add_argument("sub", choices=["shell", "query", "dump", "restore"])
+    s.add_argument("arg", nargs="?",
+                   help="SQL for `query` (jos_ prefix), or dump file for `restore`")
+    s.add_argument("--force", action="store_true",
+                   help="required for `restore` (overwrites the live database)")
+    s.add_argument("--confirm", help="exact target id printed by `autohub status`")
+    s.set_defaults(fn=cmd_db)
+
+    s = add("backup", help="host-side full-state snapshots")
+    s.add_argument("sub", choices=["create", "restore"])
+    s.add_argument("path", nargs="?", help="snapshot directory for restore")
+    s.add_argument("--label", help="short label for a new snapshot")
+    s.add_argument("--force", action="store_true",
+                   help="required for restore (overwrites live source/app/database state)")
+    s.add_argument("--confirm", help="exact target id printed by `autohub status`")
+    s.set_defaults(fn=cmd_backup)
+
+    add("migrate", help="apply pending migrations").set_defaults(fn=cmd_migrate)
+
+    s = add("ext", help="extensions")
+    s.add_argument("sub", choices=["list", "install", "enable", "disable"])
+    s.add_argument("name", nargs="?")
+    s.set_defaults(fn=cmd_ext)
+
+    s = add("admin", help="create/reset an administrator")
+    s.add_argument("user")
+    s.set_defaults(fn=cmd_admin)
+
+    s = add("template", help="template git repo: status / push")
+    s.add_argument("sub", choices=["status", "push"])
+    s.add_argument("--name", help="template dir under app/templates (auto if only one)")
+    s.add_argument("--branch", help="branch to push (default: current)")
+    s.add_argument("--token-env", default="GITLAB_TOKEN",
+                   help="container env var holding the push token (default GITLAB_TOKEN)")
+    s.add_argument("--force", action="store_true", help="push with --force-with-lease")
+    s.set_defaults(fn=cmd_template)
+
+    s = add("update", help="pull the CMS ref and migrate")
+    s.add_argument("--ref")
+    s.add_argument("--no-backup", action="store_true",
+                   help="skip the pre-update full-state snapshot (not recommended)")
+    s.add_argument("--confirm", help="exact target id required with --no-backup")
+    s.set_defaults(fn=cmd_update)
+
+    s = add("muse", help="pass a command to muse")
+    s.add_argument("args", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_muse)
+
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # SUPPRESS defaults mean a global flag is absent unless it was passed.
+    as_json = getattr(args, "json", False)
+    dev = getattr(args, "dev", False)
+    explicit_dir = getattr(args, "project_dir", None)
+
+    project_dir = explicit_dir or find_project_dir(os.getcwd()) \
+        or find_project_dir(os.path.dirname(os.path.abspath(__file__)))
+    if not project_dir:
+        message = "no docker-compose.yml found (use --project-dir)"
+        if as_json:
+            print(json.dumps({"ok": False, "action": getattr(args, "cmd", ""),
+                              "details": [message], "checks": [], "next": []}, indent=2))
+        else:
+            print("error: " + message, file=sys.stderr)
+        sys.exit(3)
+
+    env = read_env(project_dir)
+    drv = get_driver(project_dir, env, dev=dev)
+    res = Result(args.cmd)
+    try:
+        args.fn(drv, env, args, res)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:  # a crash must still honor the output contract
+        res.fail("internal error: %s" % scrub(str(e)))
+    sys.exit(res.emit(as_json))
+
+
+if __name__ == "__main__":
+    main()
