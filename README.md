@@ -50,7 +50,7 @@ You only rebuild the image when PHP itself changes, which is roughly never.
 | [docker/bin/](docker/bin/) | `hub-*` management commands, on `PATH` in every container |
 | [scripts/hub-init.sh](scripts/hub-init.sh) | Scaffolds `.env` + `hub.yml` for a new hub |
 | [hub.yml.example](hub.yml.example) | Declarative hub setup — copy to `hub.yml` |
-| [.claude/skills/spin-hub/](.claude/skills/spin-hub/SKILL.md) | Lets an agent spin up and verify a hub unattended |
+| [.agents/skills/spin-hub/](.agents/skills/spin-hub/SKILL.md) | Lets Codex spin up and verify a hub unattended |
 | [docker-compose.yml](docker-compose.yml) | Production stack: web, cron, db |
 | [docker-compose.dev.yml](docker-compose.dev.yml) | Dev overlay: local checkout, Adminer, Mailpit |
 

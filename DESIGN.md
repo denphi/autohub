@@ -69,7 +69,7 @@ Three ideas carry the whole design:
 | Ops entry points | `Makefile` (17 targets) + `hub-*` scripts in-container | done |
 | Asset pipeline w/ real error reporting | `hub-assets.sh`, `compile-assets.php` | done |
 | Backup/restore, source-sync, TLS, cron, mail sink | `hub-backup.sh`, `hub-source-sync.sh`, `hub-tls.sh`, `hub-cron.sh`, mailpit service | done |
-| AI entry point | `.claude/skills/spin-hub/SKILL.md` | v1, docker-only |
+| AI entry point | `.agents/skills/spin-hub/SKILL.md` | v1, docker-only |
 
 The gap: these are ~20 scripts + a Makefile + `docker compose` incantations.
 There is no single binary, no machine-readable output, no driver abstraction,
@@ -305,8 +305,8 @@ non-secret hub identity from `.env`.
 
 `spin-hub` v1 documented shell recipes. v2 is thin: **the Skill teaches when to
 act; the CLI knows how.** Both skills shipped
-([`.claude/skills/spin-hub`](.claude/skills/spin-hub/SKILL.md),
-[`.claude/skills/maintain-hub`](.claude/skills/maintain-hub/SKILL.md)).
+([`.agents/skills/spin-hub`](.agents/skills/spin-hub/SKILL.md),
+[`.agents/skills/maintain-hub`](.agents/skills/maintain-hub/SKILL.md)).
 
 - `spin-hub` rewritten around CLI calls (`autohub init` → `up --wait` →
   `verify`), keeping only the judgment content: the rules (.env vs hub.yml,

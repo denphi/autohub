@@ -1,0 +1,4 @@
+interface:
+  display_name: "Spin HUBzero Hub"
+  short_description: "Create or reset a verified HUBzero deployment"
+  default_prompt: "Use $spin-hub to create and verify a new HUBzero deployment."
