@@ -885,7 +885,7 @@ def _try_admin_login(base, user, pw):
         return False
 
 
-# doctor: log pattern -> known cause (seeded from the spin-hub troubleshooting
+# doctor: log pattern -> known cause (seeded from the skill's troubleshooting
 # table plus failures diagnosed while testing real HUBzero deployments)
 DOCTOR_PATTERNS = [
     (r"getaddrinfo for mail failed|Connection could not be established with host",

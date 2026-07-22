@@ -1,7 +1,25 @@
-# AutoHub — HUBzero CMS on Docker
+# AutoHub scaffold reference
 
 A deployable [HUBzero CMS](https://github.com/hubzero/hubzero-cms) stack that
-installs itself and updates without an image rebuild.
+installs itself and updates without an image rebuild. Paths in this document
+refer to a project created from `assets/scaffold/`, not to the skill package
+root.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [The app-less image](#the-one-idea-worth-knowing)
+- [Project layout](#layout)
+- [Development](#development)
+- [Commands](#commands)
+- [Configuration](#configuration)
+- [Declaring the hub](#declaring-the-hub-hubyml)
+- [First boot](#how-first-boot-installs-the-hub)
+- [Upstream behaviors](#four-upstream-behaviours-that-will-surprise-you)
+- [Production notes](#production-notes)
+- [Requirements](#requirements)
+
+## Quick start
 
 ```bash
 ./scripts/hub-init.sh --site "My Hub"    # generates .env + hub.yml, all secrets random
@@ -43,16 +61,15 @@ You only rebuild the image when PHP itself changes, which is roughly never.
 
 | Path | What it is |
 |---|---|
-| [docker/Dockerfile](docker/Dockerfile) | The runtime image |
-| [docker/apache/hubzero.conf](docker/apache/hubzero.conf) | the `:80` and `:443` vhosts |
-| [docker/apache/hubzero-common.conf](docker/apache/hubzero-common.conf) | front-controller rewrite + what must never be served |
-| [docker/php/hubzero.ini](docker/php/hubzero.ini) | PHP tuning |
-| [docker/bin/](docker/bin/) | `hub-*` management commands, on `PATH` in every container |
-| [scripts/hub-init.sh](scripts/hub-init.sh) | Scaffolds `.env` + `hub.yml` for a new hub |
-| [hub.yml.example](hub.yml.example) | Declarative hub setup — copy to `hub.yml` |
-| [.agents/skills/spin-hub/](.agents/skills/spin-hub/SKILL.md) | Lets Codex spin up and verify a hub unattended |
-| [docker-compose.yml](docker-compose.yml) | Production stack: web, cron, db |
-| [docker-compose.dev.yml](docker-compose.dev.yml) | Dev overlay: local checkout, Adminer, Mailpit |
+| [docker/Dockerfile](../assets/scaffold/docker/Dockerfile) | The runtime image |
+| [docker/apache/hubzero.conf](../assets/scaffold/docker/apache/hubzero.conf) | the `:80` and `:443` vhosts |
+| [docker/apache/hubzero-common.conf](../assets/scaffold/docker/apache/hubzero-common.conf) | front-controller rewrite + what must never be served |
+| [docker/php/hubzero.ini](../assets/scaffold/docker/php/hubzero.ini) | PHP tuning |
+| [docker/bin/](../assets/scaffold/docker/bin/) | `hub-*` management commands, on `PATH` in every container |
+| [scripts/hub-init.sh](../assets/scaffold/scripts/hub-init.sh) | Scaffolds `.env` + `hub.yml` for a new hub |
+| [hub.yml.example](../assets/scaffold/hub.yml.example) | Declarative hub setup — copy to `hub.yml` |
+| [docker-compose.yml](../assets/scaffold/docker-compose.yml) | Production stack: web, cron, db |
+| [docker-compose.dev.yml](../assets/scaffold/docker-compose.dev.yml) | Dev overlay: local checkout, Adminer, Mailpit |
 
 Three volumes, with deliberately different lifetimes:
 
@@ -104,7 +121,7 @@ HUBzero reads no environment variables. `Hubzero\Config\FileLoader` loads plain
 PHP arrays out of `app/config/`, and upstream expects you to produce them with
 the interactive `/install` wizard.
 
-[docker/bin/render-config.php](docker/bin/render-config.php) is the bridge. It
+[docker/bin/render-config.php](../assets/scaffold/docker/bin/render-config.php) is the bridge. It
 takes upstream's own templates in `core/bootstrap/Install/config/` as the base —
 rather than duplicating them here, so new settings appear on their own after an
 update — and layers on top, in order:
@@ -129,7 +146,7 @@ rotating it silently invalidates every session and password-reset token. Set
 ## Declaring the hub: hub.yml
 
 The admin UI is the only supported way to set up a HUBzero hub, which makes a
-hub impossible to rebuild from scratch and impossible to review. [hub.yml](hub.yml.example)
+hub impossible to rebuild from scratch and impossible to review. [hub.yml](../assets/scaffold/hub.yml.example)
 is the alternative: a committed manifest describing what the hub *is*, applied
 on every boot and by `make provision`.
 
@@ -227,7 +244,7 @@ exists to close that gap.
    uncatchable PHP 8 fatal in `Macros\SavePluginParams` (incompatible `__invoke`
    signature), and `muse migration -f` aborts on the first error regardless.
 
-   So [repair-schema.php](docker/bin/repair-schema.php) replays a targeted
+   So [repair-schema.php](../assets/scaffold/docker/bin/repair-schema.php) replays a targeted
    subset, worked out from the migrations themselves rather than a hand-written
    list that would rot. It reads every migration and queues three groups:
 
@@ -292,7 +309,7 @@ handler logs the warning to `app/logs` *before* deciding whether to die.
 - **TLS**: either mount real certificates into `hub_tls`, or terminate upstream
   and let the vhost's `X-Forwarded-Proto` handling take over. Set
   `HUB_FORCE_SSL=1` and `HUB_LIVE_SITE=https://your.hub`, and uncomment the HSTS
-  header in [hubzero.conf](docker/apache/hubzero.conf) once the hostname has a
+  header in [hubzero.conf](../assets/scaffold/docker/apache/hubzero.conf) once the hostname has a
   real certificate.
 - **Don't publish the database port.** The base compose file doesn't; the dev
   overlay does, deliberately.

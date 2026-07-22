@@ -8,6 +8,18 @@ This document captures requirements learned from real HUBzero deployments —
 every requirement below traces to something that broke,
 surprised us, or had to be discovered the hard way.
 
+## Contents
+
+- [Vision](#1-vision)
+- [Current state](#2-current-state-what-already-works)
+- [Requirements](#3-requirements--what-production-like-hubzero-testing-taught-us)
+- [CLI contract and command tree](#4-the-cli)
+- [Unified skill](#5-the-skill-)
+- [Manifest evolution](#6-manifest-evolution)
+- [Roadmap](#7-roadmap)
+- [Open questions](#8-open-questions)
+- [Incident index](#appendix-a--incident--requirement-index)
+
 ---
 
 ## 1. Vision
@@ -69,11 +81,9 @@ Three ideas carry the whole design:
 | Ops entry points | `Makefile` (17 targets) + `hub-*` scripts in-container | done |
 | Asset pipeline w/ real error reporting | `hub-assets.sh`, `compile-assets.php` | done |
 | Backup/restore, source-sync, TLS, cron, mail sink | `hub-backup.sh`, `hub-source-sync.sh`, `hub-tls.sh`, `hub-cron.sh`, mailpit service | done |
-| AI entry point | `.agents/skills/spin-hub/SKILL.md` | v1, docker-only |
+| AI entry point | root `SKILL.md` | unified create + maintain workflow |
 
-The gap: these are ~20 scripts + a Makefile + `docker compose` incantations.
-There is no single binary, no machine-readable output, no driver abstraction,
-and the Skill documents shell recipes instead of calling commands.
+These primitives motivated the unified CLI and skill contract described below.
 
 ---
 
@@ -173,7 +183,7 @@ this list was found by hitting the failure live:
 
 ## 4. The CLI
 
-Name: `autohub`. Single entry point at [`cli/autohub`](cli/autohub) — a
+Name: `autohub`. Single entry point at [`cli/autohub`](../assets/scaffold/cli/autohub) — a
 zero-dependency Python 3 script (stdlib only; see §8 for why not Go). It does
 **not** shell out to the Makefile: it drives `docker compose` directly through
 the driver (§4.3) and calls the same in-container `hub-*` commands the
@@ -198,7 +208,7 @@ The Makefile stays as a thin human convenience; the CLI is the contract.
 ### 4.2 Command tree (v1 = shipped)
 
 Every command takes the global flags `--json`, `--dev`, `--project-dir` in
-either position. What's implemented in [`cli/autohub`](cli/autohub) today:
+either position. What's implemented in [`cli/autohub`](../assets/scaffold/cli/autohub) today:
 
 ```
 autohub init      [--site --preset --template-url --force]  → scripts/hub-init.sh
@@ -265,9 +275,9 @@ line never mention docker or kubectl.
 
 ### 4.4 Kubernetes driver ✅ (verified on minikube)
 
-Shipped: [`KubernetesDriver`](cli/autohub) (same Driver interface, drives
-`kubectl`/`helm`), driver selection via [`autohub.yml`](autohub.yml.example),
-and a Helm chart under [`deploy/chart/`](deploy/chart/). Selected by
+Shipped: [`KubernetesDriver`](../assets/scaffold/cli/autohub) (same Driver interface, drives
+`kubectl`/`helm`), driver selection via [`autohub.yml`](../assets/scaffold/autohub.yml.example),
+and a Helm chart under [`deploy/chart/`](../assets/scaffold/deploy/chart/). Selected by
 `driver: kubernetes` — every `autohub` command then targets the cluster with no
 change to the command surface. **Verified end-to-end on minikube**: `helm lint`
 clean, `autohub up` installs the release and a from-scratch first boot completes
@@ -303,31 +313,20 @@ non-secret hub identity from `.env`.
 
 ## 5. The Skill ✅
 
-`spin-hub` v1 documented shell recipes. v2 is thin: **the Skill teaches when to
-act; the CLI knows how.** Both skills shipped
-([`.agents/skills/spin-hub`](.agents/skills/spin-hub/SKILL.md),
-[`.agents/skills/maintain-hub`](.agents/skills/maintain-hub/SKILL.md)).
+The repository is a single standard skill package at [`SKILL.md`](../SKILL.md):
+**the Skill teaches when to act; the CLI knows how.** The skill routes create,
+diagnose, change, backup, restore, upgrade, and reset work while the deployable
+project lives under `assets/scaffold/`.
 
-- `spin-hub` rewritten around CLI calls (`autohub init` → `up --wait` →
-  `verify`), keeping only the judgment content: the rules (.env vs hub.yml,
-  token hygiene, https, real browser, "only site.css auto-compiles", static
-  cache), and reporting expectations — never claim success without `verify`
-  passing; relay `checks[]`, not vibes.
-  Generic creation does not select an organization-specific preset implicitly. Reset and
-  forced initialization resolve an exact target and require a host-side recovery
-  point outside the volumes/PVCs being deleted.
-- `maintain-hub` (new) is diagnosis-first for a *running* hub: take a
-  `status`/`verify` baseline, then `doctor` → `logs --errors` →
-  `verify --scope` → `db query` to localize, map to an action (recompile
-  assets, clear cache, reprovision, migrate), and end on `verify`. It carries
-  the escalation rule learned this session: **a fix applied live (DB tweak,
-  container edit) must land in `hub.yml`/`provision.php` the same session or
-  it is lost** — persistence is part of "done".
-- JSON contract (§4.1) is what the Skill consumes; `next[]` suggestions keep
-  the skill text short and behavior current with the CLI.
-- Day-2 guidance distinguishes additive manifest application from convergent
-  deletion, requires browser QA for visual changes, and treats database-only
-  dumps/CronJobs as partial rather than disaster-recovery backups.
+- Creation uses `scripts/create_project.py`, then `autohub init` → `up --wait`
+  → `verify` inside the generated project.
+- Day-2 work starts with a `status`/`verify` baseline, then narrows through
+  `doctor`, error logs, scoped verification, and read-only DB queries.
+- Reset, forced initialization, and restoration resolve an exact target and
+  require a host-side recovery point outside the volumes/PVCs being changed.
+- Visual work requires browser QA; database-only dumps and CronJobs remain
+  partial rather than disaster-recovery backups.
+- The JSON contract (§4.1) keeps agent behavior synchronized with CLI behavior.
 
 ---
 
@@ -366,9 +365,9 @@ Split concerns across three files (two exist):
 
 | Milestone | Deliverable | Definition of done |
 |---|---|---|
-| **M1 — CLI skeleton** ✅ | `autohub` wrapping existing scripts, docker driver, `--json` | spin-hub flow runs end-to-end via CLI only — *done; `status`/`provision`/`assets`/`cache`/`up --wait` live against the running stack* |
+| **M1 — CLI skeleton** ✅ | `autohub` wrapping existing scripts, docker driver, `--json` | create flow runs end-to-end via CLI only — *done; `status`/`provision`/`assets`/`cache`/`up --wait` live against the running stack* |
 | **M2 — verify/doctor** ✅ | R9 + R10 commands | agent detects & explains the failure classes we hit without human hints — *done; `verify` (8 checks incl. asset sweep + login) and `doctor` (log-pattern table) shipped; caught a real 403 asset on first run* |
-| **M3 — Skill v2** ✅ | rewritten `spin-hub` + new `maintain-hub` | fresh conversation, empty dir → working custom-template hub, zero human commands — *both skills shipped, built on the CLI's `--json`/`next[]` contract* |
+| **M3 — Skill v3** ✅ | unified root `autohub` skill + bundled project scaffold | fresh conversation, empty dir → working custom-template hub, zero human commands — *single skill shipped, built on the CLI's `--json`/`next[]` contract* |
 | **M4 — manifest v2** ✅ | component params, seeds (incl. OAuth internal client), preset layering | rebuilt-from-scratch hub needs no manual DB edits (course editor works) — *param-merge + `seeds:` opt-outs + OAuth internal-client seed all shipped & verified live; preset layering **decided out** (manifest is complete/authoritative, §6)* |
 | **M5 — k8s driver** ✅ | Helm chart + driver impl | same Skill flow against a kind/minikube cluster — *verified end-to-end on minikube: `autohub up` → helm install → first boot → **site/admin 200, site.css compiled, config denied 403, admin login OK**; `status` and `destroy` exercised through the k8s driver* |
 | **M6 — day-2 ops** ✅ | backup schedule, `update` with source-sync safety, template push flows | *`update` takes a host-side full-state snapshot (DB, hub_app, TLS, source revision and project config), `template push` ships with tokenless-remote/askpass hygiene, and the recurring database-only **backup CronJob** (own PVC, retention, driven from `autohub.yml`) renders clean. Production exports snapshots off-cluster.* |

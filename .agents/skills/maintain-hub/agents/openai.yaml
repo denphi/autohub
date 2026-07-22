@@ -1,4 +1,0 @@
-interface:
-  display_name: "Maintain HUBzero Hub"
-  short_description: "Diagnose and safely maintain a HUBzero deployment"
-  default_prompt: "Use $maintain-hub to diagnose and safely maintain this HUBzero deployment."

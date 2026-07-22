@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Secrets and machine-local settings. Commit hub.yml.example; keep the live
+# deployment manifest local because it may contain organization-specific state.
+.env
+/hub.yml
+
+# Local CMS checkout used by the development overlay.
+/hubzero-cms
+
+# Dumps and full-state snapshots can contain sensitive production data.
+*.sql
+*.sql.gz
+/backups/
