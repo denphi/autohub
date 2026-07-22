@@ -1,4 +1,0 @@
-interface:
-  display_name: "AutoHub"
-  short_description: "Create and safely operate HUBzero deployments"
-  default_prompt: "Use $autohub to create, diagnose, or safely maintain a HUBzero deployment."

@@ -1,6 +1,6 @@
 ---
 name: autohub
-description: Create, deploy, diagnose, back up, restore, upgrade, and safely maintain HUBzero CMS hubs with the bundled AutoHub scaffold and `cli/autohub` command. Use when Codex needs to start a new Docker or Kubernetes HUBzero project, operate an existing AutoHub project, change its manifest or template, investigate failures, or perform guarded day-2 operations. Do not use for unrelated PHP applications or for direct production mutations outside an AutoHub project.
+description: Create, deploy, diagnose, back up, restore, upgrade, and safely maintain HUBzero CMS hubs with the bundled AutoHub scaffold and `cli/autohub` command. Use to start a new Docker or Kubernetes HUBzero project, operate an existing AutoHub project, change its manifest or template, investigate failures, or perform guarded day-2 operations. Do not use for unrelated PHP applications or direct production mutations outside an AutoHub project.
 ---
 
 # Operate HUBzero with AutoHub
@@ -129,11 +129,13 @@ cli/autohub verify --scope assets --json
 cli/autohub verify --json
 ```
 
-Then inspect every affected route in Firefox or Chrome. Check anonymous and
-authenticated states plus desktop and narrow/mobile widths. Include relevant
-group, course, resource, or administrator pages rather than relying on the
-homepage sweep. Compilation and HTTP 200 responses do not prove visual
-correctness.
+Then inspect every affected route with an available browser or browser
+automation capability. Check anonymous and authenticated states plus desktop
+and narrow/mobile widths. Include relevant group, course, resource, or
+administrator pages rather than relying on the homepage sweep. Compilation and
+HTTP 200 responses do not prove visual correctness. If no browser capability is
+available, report visual verification as incomplete instead of claiming
+success.
 
 Only `site.less` auto-compiles. Rebuild paired template, vendor, group, and
 course-layout assets. Inspect load order and specificity, and hard-reload
