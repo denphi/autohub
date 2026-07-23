@@ -17,7 +17,13 @@ JSON results, deployment-driver abstraction, and safety checks.
 - Diagnoses site, asset, mail, login, and database failures.
 - Applies declarative hub configuration from `hub.yml`.
 - Provisions editable native articles and connects menu routes by article alias.
-- Builds template assets and requires browser verification for visual changes.
+- Generates project-local templates with a native-component-first style
+  baseline and no manual Compose edits.
+- Verifies standard public component routes and every route's linked assets.
+- Diagnoses consent interstitials separately from invalid administrator
+  credentials.
+- Lints legacy LESS compatibility and requires browser verification for visual
+  changes.
 - Creates coordinated database, application-data, TLS, source, and
   configuration snapshots.
 - Guards restore, upgrade, reset, and destroy operations with explicit
@@ -77,12 +83,15 @@ From this repository, copy the immutable scaffold into a new or empty target:
 python3 scripts/create_project.py ../research-hub --json
 cd ../research-hub
 cli/autohub init --site "Research Hub" --json
+cli/autohub template create --name researchhub --json
+cli/autohub assets lint --json
 cli/autohub up --wait --json
 cli/autohub verify --json
 ```
 
 The creator refuses to merge into a non-empty directory. Initialization writes
-generated credentials to `.env` with mode `600` and does not print them.
+generated credentials to `.env` with mode `600`, assigns a project-specific
+Docker Compose namespace, probes published ports, and does not print secrets.
 
 First boot can take several minutes while the CMS source, dependencies, schema,
 configuration, and assets are prepared.
@@ -139,6 +148,8 @@ AutoHub treats operational verification as part of every change:
   complete disaster-recovery backups.
 - Template changes require browser inspection because successful compilation
   and HTTP responses do not prove visual correctness.
+- Custom templates must cover standard native component surfaces such as
+  resources, groups, members, search, and support at desktop and mobile widths.
 
 ## Repository layout
 
@@ -148,6 +159,8 @@ AutoHub treats operational verification as part of every change:
 | [`scripts/create_project.py`](scripts/create_project.py) | Copies the bundled scaffold into a new project |
 | [`assets/scaffold/`](assets/scaffold/) | Docker, Kubernetes, CLI, provisioning, and initialization assets |
 | [`references/scaffold.md`](references/scaffold.md) | Generated-project setup, configuration, first boot, and production reference |
+| [`references/content-and-templates.md`](references/content-and-templates.md) | Native content ownership and template architecture |
+| [`references/native-component-styling.md`](references/native-component-styling.md) | Component styling contract and visual acceptance matrix |
 | [`references/design.md`](references/design.md) | CLI contract, drivers, requirements, verification, and architecture decisions |
 
 ## Requirements

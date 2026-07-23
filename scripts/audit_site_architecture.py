@@ -151,17 +151,69 @@ def audit(project, require_native_content=False):
             "index.php appears to dispatch content by route or alias",
         ))
 
+        less_path = os.path.join(template, "less", "site.less")
+        less = read_text(less_path)
+        native_surfaces = {
+            "form controls": (r"\binput\b", r"\bselect\b", r"\bbutton\b"),
+            "tables": (r"\btable\b",),
+            "filters": (r"\.filters?\b",),
+            "results": (r"\.(?:entries|results)\b",),
+            "pagination": (r"\.pagination\b",),
+            "empty states": (r"\.(?:no-results|empty|empty-state)\b",),
+            "responsive rules": (r"@media\b",),
+        }
+        missing_surfaces = [
+            surface for surface, patterns in native_surfaces.items()
+            if not all(re.search(pattern, less, re.I) for pattern in patterns)
+        ]
+        checks.append(check(
+            label + ":native-component-styles",
+            not missing_surfaces,
+            "native component baseline covers shared surfaces"
+            if not missing_surfaces else
+            "site.less lacks baseline styling for: " + ", ".join(missing_surfaces),
+        ))
+
+        php_shell = "\n".join(
+            read_text(os.path.join(template, filename))
+            for filename in ("index.php", "component.php", "error.php")
+        )
+        hardcoded_app_template = bool(re.search(
+            r"['\"]/app/templates/", php_shell, re.I))
+        checks.append(check(
+            label + ":base-url-assets",
+            not hardcoded_app_template,
+            "template shell derives asset paths from the CMS base URL"
+            if not hardcoded_app_template else
+            "template PHP hard-codes /app/templates; derive paths from baseurl and the active template",
+        ))
+
     ok = all(item["ok"] for item in checks)
+    failed_names = {item["name"] for item in checks if not item["ok"]}
+    next_steps = []
+    if any(name.endswith(":native-component-styles") for name in failed_names):
+        next_steps.append(
+            "Add restrained native form, table, filter, result, pagination, empty-state, and responsive styles")
+    if any(name.endswith(":base-url-assets") for name in failed_names):
+        next_steps.append(
+            "Derive template asset paths from the CMS base URL and active template")
+    if any(name.endswith((":no-php-pages", ":no-php-catalog",
+                          ":no-page-router", ":component-buffer"))
+           for name in failed_names) or "native-articles" in failed_names:
+        next_steps.extend([
+            "Move editable pages to hub.yml articles:",
+            "Link menus with article: <alias>",
+            "Keep template index.php limited to shared chrome, modules, and component output",
+        ])
+    if any(name.endswith(":baseline-files") for name in failed_names):
+        next_steps.append(
+            "Generate the complete baseline with `cli/autohub template create --name <alias> --json`")
     return {
         "ok": ok,
         "action": "audit-site-architecture",
         "project": project,
         "checks": checks,
-        "next": [] if ok else [
-            "Move editable pages to hub.yml articles:",
-            "Link menus with article: <alias>",
-            "Keep template index.php limited to shared chrome, modules, and component output",
-        ],
+        "next": [] if ok else next_steps,
     }
 
 

@@ -10,6 +10,7 @@ renders those components.
 - [Provision articles](#provision-articles)
 - [Connect menus to articles](#connect-menus-to-articles)
 - [Build a template](#build-a-template)
+- [Create a project-local template](#create-a-project-local-template)
 - [Avoid the page-router anti-pattern](#avoid-the-page-router-anti-pattern)
 - [Verify the boundary](#verify-the-boundary)
 
@@ -77,6 +78,12 @@ Store prose, semantic content markup, links, and content-specific media
 references in the article. Store shared styles and behavior in the template.
 Do not embed secrets, environment-specific hostnames, or generated credentials.
 
+Use one semantic page title. Prefer the native article title and begin the body
+below it. If a custom landing-page body supplies its own `<h1>`, declare the
+article and `com_content` title/metadata options needed to suppress duplicate
+chrome, then verify the rendered DOM has exactly one visible `<h1>`. Do not
+solve duplicate titles with route-aware or adjacent-selector CSS.
+
 ## Connect menus to articles
 
 Use the article alias shorthand instead of copying a database id into a menu:
@@ -142,6 +149,33 @@ Render primary navigation from the configured menu module. Do not hard-code a
 second navigation list in `index.php`. Render login/account state from a module
 or shared template chrome, not from page-specific content files.
 
+Load assets through the document asset API and derive template image/script
+paths from the CMS base URL and active template name. Do not hard-code
+`/app/templates/<name>` URLs.
+
+Keep native typography and controls restrained, then scope expressive
+landing-page design under a project-specific wrapper. Follow
+[native component styling and acceptance](native-component-styling.md) for the
+required base primitives and browser matrix.
+
+## Create a project-local template
+
+Use the scaffolded workflow for a new template:
+
+```bash
+cli/autohub template create --name researchhub --json
+cli/autohub assets lint --json
+```
+
+The command copies the complete starter into `templates/researchhub`, updates
+the project-local mount in `.env`, and registers and activates the alias in
+`hub.yml`. Do not edit `docker-compose.yml` to invent a one-off bind mount.
+
+The host-side lint blocks mixed-unit CSS `min()` and `max()` calls that
+HUBzero's legacy LesserPHP compiler attempts and fails to evaluate. Use
+`width`/`max-width` or `height`/`min-height` constraints instead. Compile again
+inside the running CMS because the runtime compiler remains authoritative.
+
 ## Avoid the page-router anti-pattern
 
 Reject a template implementation that does any of the following:
@@ -175,7 +209,9 @@ python3 <skill-dir>/scripts/audit_site_architecture.py \
 
 This fails on missing baseline template files, template-side PHP pages,
 route-dispatch logic in `index.php`, template-side PHP catalogs, a missing
-component buffer, a `Pages` resource type, or a missing native article section.
+component buffer, a `Pages` resource type, a missing native article section,
+missing shared native-component style surfaces, or hard-coded template asset
+paths in the PHP shell.
 
 After `cli/autohub provision --json`, run read-only checks such as:
 

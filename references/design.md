@@ -217,8 +217,8 @@ autohub down                                         → compose down (keeps vol
 autohub destroy   --force --confirm <target> --snapshot <dir> → delete volumes only after target + recovery validation
 autohub status                                       → per-service state/health + url (R11)
 autohub provision                                    → hub-provision; parses "N applied, M failed" (R1–R4)
-autohub verify    [--scope all|site|assets|mail|login|db]   (R9)
-autohub assets    build|clean                        → hub-assets [--clean] (R5)
+autohub verify    [--scope all|site|assets|components|mail|login|db] [--route PATH]   (R9)
+autohub assets    build|clean|lint                   → host LESS preflight + hub-assets (R5)
 autohub cache     clear [--warm]                     → hub-muse cache clear (+ warm request) (R6)
 autohub doctor    [--tail]                           → recent web logs → known-cause table (R10)
 autohub logs      [--errors --tail --limit --follow] → web logs, secret-scrubbed
@@ -227,19 +227,18 @@ autohub backup    create|restore                     → host-side DB + hub_app 
 autohub migrate                                      → hub-migrate
 autohub ext       list|install|enable|disable        → jos_extensions list; mutate via hub.yml + provision (R4)
 autohub admin     <user>                             → hub-admin; password comes from .env, never argv
-autohub template  status|push [--name --branch --force]  → template git repo; push via GIT_ASKPASS (R8)
+autohub template  create|status|push [--name --branch --force]  → local starter or template git repo (R8)
 autohub update    [--ref --no-backup]                → full-state snapshot, hub-update, restart web (M6 safety)
 autohub muse      <args…>                            → hub-muse passthrough
 ```
 
-**Live M1/M2 result** (against a running custom-template test stack): `status`
-reports all four services healthy; `verify` runs eight checks — homepage +
-admin 200, `site.css` compiled (170 KB), `config/database.php` denied (403),
-a full **homepage asset sweep** (every linked css/js must resolve), SMTP
-reachability, an end-to-end `/administrator` login (CSRF-token dance), and an
-app-bootstrap/db probe. On first run the asset sweep caught a real 403 on a
-0-byte `mod_whatsnew_custom.css` the homepage links — exactly the "asset URL
-returns non-200" class R9 exists to surface.
+**Initial live M1/M2 result** (against a running custom-template test stack):
+`status` reports all four services healthy. Verification covers the homepage,
+administrator, compiled stylesheet, denied private config, SMTP,
+administrator authentication, and application bootstrap. The component scope
+now inventories primary-menu plus standard native routes and sweeps linked CSS,
+JavaScript, images, and fonts on every route. The original asset sweep caught a
+real 403 on a 0-byte `mod_whatsnew_custom.css`.
 
 An unavailable administrator-login check now fails verification rather than
 silently reducing coverage. Visual/template work still requires browser
@@ -369,7 +368,7 @@ Split concerns across three files (two exist):
 | Milestone | Deliverable | Definition of done |
 |---|---|---|
 | **M1 — CLI skeleton** ✅ | `autohub` wrapping existing scripts, docker driver, `--json` | create flow runs end-to-end via CLI only — *done; `status`/`provision`/`assets`/`cache`/`up --wait` live against the running stack* |
-| **M2 — verify/doctor** ✅ | R9 + R10 commands | agent detects & explains the failure classes we hit without human hints — *done; `verify` (8 checks incl. asset sweep + login) and `doctor` (log-pattern table) shipped; caught a real 403 asset on first run* |
+| **M2 — verify/doctor** ✅ | R9 + R10 commands | agent detects & explains the failure classes we hit without human hints — *done; `verify` includes multi-route component/asset sweeps and structured login diagnostics; `doctor` retains the log-pattern table* |
 | **M3 — Skill v3** ✅ | unified root `autohub` skill + bundled project scaffold | fresh conversation, empty dir → working custom-template hub, zero human commands — *single skill shipped, built on the CLI's `--json`/`next[]` contract* |
 | **M4 — manifest v2** ✅ | component params, seeds (incl. OAuth internal client), preset layering | rebuilt-from-scratch hub needs no manual DB edits (course editor works) — *param-merge + `seeds:` opt-outs + OAuth internal-client seed all shipped & verified live; preset layering **decided out** (manifest is complete/authoritative, §6)* |
 | **M5 — k8s driver** ✅ | Helm chart + driver impl | same Skill flow against a kind/minikube cluster — *verified end-to-end on minikube: `autohub up` → helm install → first boot → **site/admin 200, site.css compiled, config denied 403, admin login OK**; `status` and `destroy` exercised through the k8s driver* |

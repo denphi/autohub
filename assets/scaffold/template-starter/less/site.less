@@ -1,0 +1,508 @@
+/* AutoHub native-component-first template baseline.
+ *
+ * Keep the unscoped layer restrained: every public HUBzero component inherits
+ * it. Add branded landing-page rules below a project-specific wrapper class.
+ * The syntax deliberately targets HUBzero's legacy LesserPHP compiler.
+ */
+
+@ink: #1e2933;
+@muted: #52616d;
+@brand: #176b66;
+@brand-dark: #0e4d49;
+@accent: #f1b24a;
+@surface: #ffffff;
+@surface-soft: #f3f7f6;
+@line: #d6e0de;
+@danger: #a62929;
+@focus: #7a2f73;
+
+* {
+	box-sizing: border-box;
+}
+
+html {
+	font-size: 100%;
+	background: @surface-soft;
+}
+
+body {
+	margin: 0;
+	min-width: 0;
+	color: @ink;
+	background: @surface;
+	font-family: "Segoe UI", Helvetica, Arial, sans-serif;
+	font-size: 1rem;
+	line-height: 1.6;
+}
+
+img,
+svg,
+video {
+	display: block;
+	max-width: 100%;
+	height: auto;
+}
+
+a {
+	color: @brand-dark;
+	text-decoration-thickness: 0.08em;
+	text-underline-offset: 0.16em;
+}
+
+a:hover {
+	color: @brand;
+}
+
+a:focus,
+button:focus,
+input:focus,
+select:focus,
+textarea:focus,
+[tabindex]:focus {
+	outline: 3px solid @focus;
+	outline-offset: 3px;
+}
+
+h1,
+h2,
+h3,
+h4 {
+	margin-top: 0;
+	color: @ink;
+	line-height: 1.2;
+}
+
+h1 {
+	font-size: 2.35rem;
+}
+
+h2 {
+	font-size: 1.8rem;
+}
+
+h3 {
+	font-size: 1.35rem;
+}
+
+p,
+ul,
+ol,
+dl,
+figure {
+	margin-top: 0;
+}
+
+.ah-shell,
+.ah-main > .contentpane,
+.ah-main > .contentpaneopen,
+.ah-main > .item-page,
+.ah-main > .container,
+.ah-main > form,
+.ah-main > .component {
+	width: 92%;
+	max-width: 78rem;
+	margin-right: auto;
+	margin-left: auto;
+}
+
+.ah-skip-link {
+	position: absolute;
+	z-index: 100;
+	top: 0.5rem;
+	left: 0.5rem;
+	padding: 0.65rem 0.9rem;
+	background: @surface;
+	transform: translateY(-160%);
+}
+
+.ah-skip-link:focus {
+	transform: translateY(0);
+}
+
+.ah-site-header {
+	border-bottom: 1px solid @line;
+	background: @surface;
+}
+
+.ah-site-header__inner {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 1.5rem;
+	min-height: 5rem;
+}
+
+.ah-brand {
+	color: @ink;
+	font-size: 1.3rem;
+	font-weight: 700;
+	text-decoration: none;
+}
+
+.ah-primary-nav ul {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.25rem;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+.ah-primary-nav a {
+	display: block;
+	padding: 0.55rem 0.75rem;
+	border-radius: 0.35rem;
+	text-decoration: none;
+}
+
+.ah-primary-nav .active > a,
+.ah-primary-nav a:hover {
+	background: @surface-soft;
+}
+
+.ah-main {
+	min-height: 55vh;
+	padding-top: 2.5rem;
+	padding-bottom: 4rem;
+}
+
+.ah-site-footer {
+	padding-top: 2rem;
+	padding-bottom: 2rem;
+	border-top: 1px solid @line;
+	color: @muted;
+	background: @surface-soft;
+}
+
+.ah-system-messages,
+.messages,
+.message,
+.alert,
+.notice {
+	margin-top: 1rem;
+	margin-bottom: 1rem;
+}
+
+.message,
+.alert,
+.notice {
+	padding: 0.85rem 1rem;
+	border: 1px solid @line;
+	border-left: 0.35rem solid @brand;
+	background: @surface-soft;
+}
+
+.error,
+.alert-error,
+.message-error {
+	border-left-color: @danger;
+}
+
+/* Native component structure: resources, groups, members, search, support. */
+.contentpane,
+.contentpaneopen,
+.component,
+.main,
+.aside,
+.entries,
+.entry,
+.results,
+.result,
+.filters,
+.pagination,
+.container {
+	min-width: 0;
+}
+
+.with-aside,
+.component-content,
+.main-and-aside {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) 18rem;
+	gap: 2rem;
+}
+
+.aside,
+aside {
+	overflow-wrap: anywhere;
+}
+
+.component-header,
+.content-header,
+.page-header,
+.subject {
+	margin-bottom: 1.5rem;
+	padding-bottom: 1rem;
+	border-bottom: 1px solid @line;
+}
+
+.component-header h1,
+.content-header h1,
+.page-header h1,
+.subject h1 {
+	margin-bottom: 0.35rem;
+}
+
+.filters,
+.filter,
+.search,
+.search-form {
+	margin-bottom: 1.5rem;
+	padding: 1rem;
+	border: 1px solid @line;
+	border-radius: 0.5rem;
+	background: @surface-soft;
+}
+
+fieldset {
+	min-width: 0;
+	margin: 0 0 1.5rem;
+	padding: 1rem;
+	border: 1px solid @line;
+	border-radius: 0.5rem;
+}
+
+legend,
+label {
+	font-weight: 600;
+}
+
+input,
+select,
+textarea,
+button {
+	max-width: 100%;
+	font: inherit;
+}
+
+input[type="text"],
+input[type="email"],
+input[type="password"],
+input[type="search"],
+input[type="url"],
+input[type="number"],
+select,
+textarea {
+	width: 100%;
+	min-height: 2.65rem;
+	padding: 0.55rem 0.7rem;
+	border: 1px solid #9caeaa;
+	border-radius: 0.35rem;
+	color: @ink;
+	background: @surface;
+}
+
+textarea {
+	min-height: 8rem;
+}
+
+button,
+.button,
+.btn,
+input[type="submit"],
+input[type="button"] {
+	display: inline-block;
+	min-height: 2.65rem;
+	padding: 0.55rem 0.9rem;
+	border: 1px solid @brand-dark;
+	border-radius: 0.35rem;
+	color: @surface;
+	background: @brand-dark;
+	font-weight: 700;
+	line-height: 1.35;
+	text-decoration: none;
+	cursor: pointer;
+}
+
+button:hover,
+.button:hover,
+.btn:hover,
+input[type="submit"]:hover,
+input[type="button"]:hover {
+	color: @surface;
+	background: @brand;
+}
+
+button[disabled],
+.disabled,
+input[disabled] {
+	opacity: 0.58;
+	cursor: not-allowed;
+}
+
+.entries,
+.results {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+.entry,
+.result,
+.resource,
+.group,
+.member {
+	margin-bottom: 1rem;
+	padding: 1rem;
+	border: 1px solid @line;
+	border-radius: 0.5rem;
+	background: @surface;
+}
+
+.entry-meta,
+.metadata,
+.details,
+.result-meta {
+	color: @muted;
+	font-size: 0.92rem;
+}
+
+.tabs,
+.tabbed {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.25rem;
+	margin: 0 0 1.5rem;
+	padding: 0;
+	border-bottom: 1px solid @line;
+	list-style: none;
+}
+
+.tabs a,
+.tabbed a {
+	display: block;
+	padding: 0.65rem 0.8rem;
+	text-decoration: none;
+}
+
+.tabs .active a,
+.tabbed .active a {
+	border-bottom: 0.2rem solid @brand;
+}
+
+.table-wrap {
+	max-width: 100%;
+	overflow-x: auto;
+}
+
+table {
+	width: 100%;
+	max-width: 100%;
+	border-collapse: collapse;
+}
+
+th,
+td {
+	padding: 0.7rem;
+	border-bottom: 1px solid @line;
+	text-align: left;
+	vertical-align: top;
+}
+
+th {
+	background: @surface-soft;
+}
+
+.pagination {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.3rem;
+	margin-top: 1.5rem;
+	padding: 0;
+	list-style: none;
+}
+
+.pagination a,
+.pagination span {
+	display: block;
+	min-width: 2.4rem;
+	padding: 0.4rem 0.65rem;
+	border: 1px solid @line;
+	border-radius: 0.3rem;
+	text-align: center;
+	text-decoration: none;
+}
+
+.pagination .active,
+.pagination strong {
+	color: @surface;
+	background: @brand-dark;
+}
+
+.no-results,
+.empty,
+.empty-state {
+	padding: 1.5rem;
+	border: 1px dashed #9caeaa;
+	border-radius: 0.5rem;
+	color: @muted;
+	background: @surface-soft;
+	text-align: center;
+}
+
+.ah-component-view {
+	padding-top: 2rem;
+	padding-bottom: 2rem;
+}
+
+.ah-error-page {
+	padding-top: 4rem;
+	background: @surface-soft;
+}
+
+.ah-error-card {
+	max-width: 48rem;
+	padding: 2rem;
+	border: 1px solid @line;
+	border-radius: 0.6rem;
+	background: @surface;
+}
+
+.ah-kicker {
+	color: @brand-dark;
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+}
+
+@media (max-width: 800px) {
+	.ah-site-header__inner {
+		align-items: flex-start;
+		flex-direction: column;
+		padding-top: 1rem;
+		padding-bottom: 1rem;
+	}
+
+	.with-aside,
+	.component-content,
+	.main-and-aside {
+		grid-template-columns: 1fr;
+	}
+
+	.ah-main {
+		padding-top: 1.5rem;
+	}
+
+	h1 {
+		font-size: 2rem;
+	}
+
+	table {
+		display: block;
+		overflow-x: auto;
+	}
+}
+
+@media print {
+	.ah-site-header,
+	.ah-site-footer,
+	.ah-primary-nav,
+	.filters,
+	.pagination {
+		display: none;
+	}
+
+	.ah-main {
+		padding: 0;
+	}
+}

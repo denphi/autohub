@@ -28,6 +28,9 @@ while a required check failed, was skipped, or still needs visual inspection.
 - Read [references/content-and-templates.md](references/content-and-templates.md)
   before creating site pages, navigation, a custom template, or a substantial
   content catalog.
+- Read [references/native-component-styling.md](references/native-component-styling.md)
+  before creating or changing a site template. It defines the mandatory
+  native-component styling and browser acceptance matrix.
 
 ## Create a project
 
@@ -48,9 +51,11 @@ cli/autohub up --wait --json
 cli/autohub verify --json
 ```
 
-First boot can take several minutes while the CMS is cloned, dependencies are
-installed, and the schema is loaded and repaired. Use `up --wait`; do not
-replace it with ad-hoc log polling.
+`init` assigns a project-specific Compose namespace and probes host ports on
+wildcard IPv4 and IPv6 interfaces. Do not replace its generated namespace with
+a shared name. First boot can take several minutes while the CMS is cloned,
+dependencies are installed, and the schema is loaded and repaired. Use
+`up --wait`; do not replace it with ad-hoc log polling.
 
 `init` stores generated credentials in `.env` with mode 600. Report that the
 credentials were created and where they are stored, but never reproduce a
@@ -83,7 +88,7 @@ Use the narrowest useful sequence:
 ```bash
 cli/autohub doctor --json
 cli/autohub logs --errors --json
-cli/autohub verify --scope <site|assets|mail|login|db> --json
+cli/autohub verify --scope <site|assets|components|mail|login|db> --json
 cli/autohub db query "SELECT ... FROM jos_extensions" --json
 ```
 
@@ -154,6 +159,23 @@ python3 <skill-dir>/scripts/audit_site_architecture.py \
 Treat any failed check as blocking. Fix the ownership violation rather than
 weakening or bypassing the audit.
 
+For a new project-local template, use the supported generator instead of
+editing Docker Compose or inventing a mount:
+
+```bash
+cli/autohub template create --name <template-alias> --json
+cli/autohub assets lint --json
+```
+
+The command creates the complete template baseline, registers and activates it
+in `hub.yml`, and configures its project-local mount in `.env`.
+
+Use exactly one semantic page title. Prefer the native article title and style
+the component heading. If the article body supplies its own `<h1>`, explicitly
+suppress native title/metadata chrome, then verify that the rendered DOM has
+exactly one visible `<h1>`; do not depend on adjacent selectors or route-specific
+CSS to hide duplicates.
+
 After provisioning, confirm that article aliases exist in `#__content`, menu
 items point to `com_content`, resources exist in `#__resources`, and each route
 renders through the active component. Content is incomplete if it exists only
@@ -165,23 +187,35 @@ administrator component.
 After changing template files, run:
 
 ```bash
+cli/autohub assets lint --json
 cli/autohub assets build --json
 cli/autohub cache clear --warm --json
 cli/autohub verify --scope assets --json
+cli/autohub verify --scope components --json
 cli/autohub verify --json
 ```
 
-Then inspect every affected route with an available browser or browser
-automation capability. Check anonymous and authenticated states plus desktop
-and narrow/mobile widths. Include relevant group, course, resource, or
-administrator pages rather than relying on the homepage sweep. Compilation and
-HTTP 200 responses do not prove visual correctness. If no browser capability is
-available, report visual verification as incomplete instead of claiming
-success.
+Pass each authored route with `--route <path>` when it is not discoverable from
+the main menu. The component scope inventories main-menu routes plus
+`/resources`, `/groups`, `/members`, `/search`, and `/support`, and sweeps each
+route's static assets. It proves reachability, not visual correctness.
 
-Only `site.less` auto-compiles. Rebuild paired template, vendor, group, and
-course-layout assets. Inspect load order and specificity, and hard-reload
-static assets that lack a version query.
+Then inspect every authored route and the mandatory native-component matrix
+with an available browser or browser automation capability. Check anonymous
+desktop and narrow/mobile states; check authenticated states where applicable.
+Test empty states for every reachable public component and populated list/detail
+states for components the hub uses. Check headings, main/aside layouts, filters,
+forms, actions, tables, tabs, pagination, messages, focus, overflow, and errors.
+For local visual QA, use the equivalent HTTP frontend if automation rejects the
+self-signed certificate; retain HTTPS for administrator login verification. If
+no browser capability is available, report visual verification as incomplete
+instead of claiming success.
+
+Legacy LesserPHP cannot evaluate mixed-unit CSS `min()`/`max()` expressions.
+Run the host-side lint before startup and replace them with compatible width,
+max-width, height, or min-height constraints. Only `site.less` auto-compiles.
+Rebuild paired template, vendor, group, and course-layout assets. Inspect load
+order and specificity, and hard-reload static assets that lack a version query.
 
 Before publishing template commits, run `template status --json` and review the
 branch, remote, ahead/behind state, and dirty files. Push only when the user

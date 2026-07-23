@@ -41,6 +41,10 @@ plugins:
     - system/incomplete
   disable:
     - user/constantcontact
+    # For a local demonstration only, disabling system/userconsent prevents its
+    # anonymous consent screen from replacing the administrator login form.
+    # Production hubs should configure their required consent policy instead.
+    # - system/userconsent
   # Per-plugin settings, merged into the plugin's existing params.
   params:
     editors/ckeditor:
@@ -51,6 +55,22 @@ plugins:
 # MERGED into the component's existing settings -- listing one key never wipes
 # the others -- so you only name what you want to change.
 components:
+  # These options support landing-page article bodies that provide their own
+  # semantic h1. If native article titles are desired, omit show_title and do
+  # not duplicate the title inside article content.
+  com_content:
+    show_title: 0
+    show_category: 0
+    show_parent_category: 0
+    show_author: 0
+    show_create_date: 0
+    show_modify_date: 0
+    show_publish_date: 0
+    show_item_navigation: 0
+    show_icons: 0
+    show_print_icon: 0
+    show_email_icon: 0
+    show_hits: 0
   com_members:
     allowUserRegistration: 1
     useractivation: 1
@@ -94,6 +114,8 @@ resource_types:
 # General site pages belong in native com_content articles, not PHP files in a
 # template. They remain editable through Content > Article Manager. Articles
 # are matched on alias; `content` is the complete body for a single-page item.
+# This example uses an authored h1 plus the com_content options above. Render
+# exactly one visible h1; do not hide duplicate native chrome with route CSS.
 articles:
   - title: Home
     alias: home

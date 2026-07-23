@@ -27,10 +27,11 @@ root.
 make up
 ```
 
-`hub-init.sh` picks free ports, generates every secret, writes `.env` mode 600
-and refuses to clobber existing files without `--force`. `--help` lists the
-options; `make init ARGS="--site ..."` is the same thing. Generated passwords
-remain in `.env` and are deliberately not printed.
+`hub-init.sh` probes wildcard IPv4 and IPv6 bindings for free ports, generates
+every secret, assigns a project-specific Compose namespace, writes `.env` mode
+600, and refuses to clobber existing files without `--force`. `--help` lists
+the options; `make init ARGS="--site ..."` is the same thing. Generated
+passwords remain in `.env` and are deliberately not printed.
 
 First boot takes a few minutes (clone, `composer install`, schema load, schema
 repair). Watch it with `make logs`. When it settles:
@@ -68,6 +69,7 @@ You only rebuild the image when PHP itself changes, which is roughly never.
 | [docker/php/hubzero.ini](../assets/scaffold/docker/php/hubzero.ini) | PHP tuning |
 | [docker/bin/](../assets/scaffold/docker/bin/) | `hub-*` management commands, on `PATH` in every container |
 | [scripts/hub-init.sh](../assets/scaffold/scripts/hub-init.sh) | Scaffolds `.env` + `hub.yml` for a new hub |
+| [template-starter/](../assets/scaffold/template-starter/) | Native-component-first baseline used by `autohub template create` |
 | [hub.yml.example](../assets/scaffold/hub.yml.example) | Declarative hub setup — copy to `hub.yml` |
 | [docker-compose.yml](../assets/scaffold/docker-compose.yml) | Production stack: web, cron, db |
 | [docker-compose.dev.yml](../assets/scaffold/docker-compose.dev.yml) | Dev overlay: local checkout, Adminer, Mailpit |
@@ -115,6 +117,19 @@ run directly with `docker compose exec web <script>`:
 | `hub-update [ref]` | source + deps + config + migrations, in one step |
 
 Everything is idempotent — a restart re-runs the lot and changes nothing.
+
+The host CLI also owns local template creation and verification:
+
+```bash
+cli/autohub template create --name researchhub --json
+cli/autohub assets lint --json
+cli/autohub verify --scope components --route /about --json
+```
+
+The template command creates and mounts `templates/researchhub`, updates
+`hub.yml`, and avoids one-off Compose edits. Component verification inventories
+the primary menu and standard public component routes, then checks their linked
+static assets.
 
 ## Configuration
 
@@ -224,6 +239,11 @@ site pages in template-side `pages/*.php` files, dispatch page content from
 [content and template architecture](content-and-templates.md) for the full
 mapping and verification checklist.
 
+Custom templates must also keep `/resources`, `/groups`, `/members`, `/search`,
+and `/support` readable and responsive even when those components are not in
+the primary navigation. See
+[native component styling and acceptance](native-component-styling.md).
+
 ### Replicating an existing hub
 
 Two routes, and the second is usually faster:
@@ -329,6 +349,14 @@ logs — it looks like a broken theme rather than a one-character bug. `hub-asse
 runs the same compile deliberately at boot and prints the file, line and
 offending declaration. Note the compiled output lands in `app/cache/<client>/site.css`,
 which the vhost must serve even though the rest of `app/` is denied.
+Run `cli/autohub assets lint --json` before startup to catch mixed-unit CSS
+`min()`/`max()` expressions that legacy LesserPHP cannot evaluate.
+
+**Administrator consent can replace the login form.** Schema repair may enable
+`system/userconsent`, so an anonymous administrator request can show a consent
+interstitial instead of the CSRF login form. AutoHub reports this distinction.
+Configure the required consent policy in production; disable the plugin only
+when that is intentional for a local demonstration.
 
 **`HUB_ERROR_REPORTING=none` is deliberate.** HUBzero's error handler turns *any*
 PHP warning into a fatal error page, and 2.4.1 still emits warnings on PHP 8 —

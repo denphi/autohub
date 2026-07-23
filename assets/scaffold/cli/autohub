@@ -18,11 +18,14 @@ target without changing command workflows.
 
 import argparse
 import datetime
+import errno
 import hashlib
+import html
 import json
 import os
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -52,14 +55,32 @@ def read_env(project_dir):
     path = os.path.join(project_dir, ".env")
     if not os.path.isfile(path):
         return env
-    for line in open(path, encoding="utf-8", errors="replace"):
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        v = v.strip().strip('"').strip("'")
-        env[k.strip()] = v
+    with open(path, encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            v = v.strip().strip('"').strip("'")
+            env[k.strip()] = v
     return env
+
+
+def update_env(project_dir, values):
+    """Update non-secret project settings without disturbing generated secrets."""
+    path = os.path.join(project_dir, ".env")
+    if not os.path.isfile(path):
+        raise Exception("run `cli/autohub init --json` before changing project settings")
+    with open(path, encoding="utf-8", errors="replace") as stream:
+        text = stream.read()
+    for key, value in values.items():
+        line = "%s=%s" % (key, value)
+        pattern = re.compile(r"^%s=.*$" % re.escape(key), re.M)
+        text = pattern.sub(lambda _match: line, text) if pattern.search(text) \
+            else text.rstrip() + "\n" + line + "\n"
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write(text)
+    os.chmod(path, 0o600)
 
 
 def read_autohub_config(project_dir):
@@ -192,7 +213,8 @@ class DockerDriver:
             r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace"))
 
     def target_id(self):
-        return "docker:" + os.path.realpath(self.dir)
+        project = self.env.get("COMPOSE_PROJECT_NAME", "autohub")
+        return "docker:%s:%s" % (project, os.path.realpath(self.dir))
 
     def url(self):
         return "https://localhost:%s" % self.env.get("HTTPS_PORT", "8443")
@@ -647,6 +669,73 @@ def _restore_snapshot(drv, path, metadata, res):
 # commands
 # ---------------------------------------------------------------------------
 
+def _port_available(port):
+    """Check wildcard IPv4 and IPv6 binds, matching Docker publication."""
+    sockets = []
+    try:
+        families = [(socket.AF_INET, ("0.0.0.0", int(port)))]
+        if socket.has_ipv6:
+            families.append((socket.AF_INET6, ("::", int(port))))
+        for family, address in families:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sockets.append(sock)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+            if family == socket.AF_INET6:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                except OSError:
+                    pass
+            try:
+                sock.bind(address)
+            except OSError as exc:
+                if exc.errno in (errno.EPERM, errno.EACCES):
+                    continue
+                if family == socket.AF_INET6 and exc.errno in (
+                        errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
+                    continue
+                return False
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
+def _docker_port_conflicts(env, dev=False):
+    keys = [("HTTP_PORT", "8080"), ("HTTPS_PORT", "8443"),
+            ("MAILPIT_PORT", "8025")]
+    if dev:
+        keys.append(("ADMINER_PORT", "8081"))
+    conflicts = []
+    published = set()
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--format", "{{.Ports}}"],
+            capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            published = {int(value) for value in re.findall(
+                r"(?:0\.0\.0\.0|\[::\]):(\d+)->",
+                result.stdout or "")}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    seen = {}
+    for key, default in keys:
+        value = env.get(key, default)
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            conflicts.append("%s=%s is not a valid port" % (key, value))
+            continue
+        if port in seen:
+            conflicts.append("%s=%s duplicates %s" % (key, port, seen[port]))
+            continue
+        seen[port] = key
+        if port in published or not _port_available(port):
+            conflicts.append("%s=%s is already in use" % (key, port))
+    return conflicts
+
+
 def cmd_init(drv, env, args, res):
     replacing = args.force and any(os.path.exists(os.path.join(drv.dir, name))
                                    for name in (".env", "hub.yml"))
@@ -670,6 +759,12 @@ def cmd_init(drv, env, args, res):
 
 
 def cmd_up(drv, env, args, res):
+    if drv.name == "docker" and not drv.status():
+        conflicts = _docker_port_conflicts(env, getattr(args, "dev", False))
+        if conflicts:
+            res.fail("host port preflight failed: " + ", ".join(conflicts))
+            res.say("choose unused ports in .env; initialization now probes wildcard IPv4 and IPv6 bindings")
+            return res
     r = drv.up()
     # up() may fail (helm error, bad compose). Surface it — the k8s path in
     # particular returns non-zero without printing to our stream.
@@ -765,7 +860,65 @@ def cmd_provision(drv, env, args, res):
     return res
 
 
+CSS_MATH_RE = re.compile(r"(?<![-\w])(min|max)\s*\(([^)]*)\)", re.I)
+CSS_UNIT_RE = re.compile(
+    r"(?:\d|\.)\s*(%|px|rem|em|vh|vw|vmin|vmax)(?![A-Za-z])", re.I)
+
+
+def _lint_less_text(text):
+    """Find mixed-unit CSS math that legacy LesserPHP tries and fails to evaluate."""
+    issues = []
+    for match in CSS_MATH_RE.finditer(text):
+        units = {unit.lower() for unit in CSS_UNIT_RE.findall(match.group(2))}
+        if len(units) > 1:
+            line = text.count("\n", 0, match.start()) + 1
+            issues.append((line, "%s() mixes units %s" %
+                           (match.group(1), ", ".join(sorted(units)))))
+    return issues
+
+
+def _local_template_dirs(project_dir, env):
+    candidates = []
+    configured = env.get("LOCAL_TEMPLATE_PATH", "")
+    if configured:
+        candidates.append(configured if os.path.isabs(configured)
+                          else os.path.join(project_dir, configured))
+    root = os.path.join(project_dir, "templates")
+    if os.path.isdir(root):
+        candidates.extend(os.path.join(root, name) for name in os.listdir(root))
+    found = []
+    for path in candidates:
+        path = os.path.realpath(path)
+        if os.path.isdir(path) and path not in found:
+            found.append(path)
+    return found
+
+
+def _lint_project_less(project_dir, env):
+    issues = []
+    for template in _local_template_dirs(project_dir, env):
+        for root, _dirs, files in os.walk(template):
+            for filename in files:
+                if not filename.endswith(".less"):
+                    continue
+                path = os.path.join(root, filename)
+                with open(path, encoding="utf-8", errors="replace") as stream:
+                    text = stream.read()
+                for line, detail in _lint_less_text(text):
+                    issues.append("%s:%d: %s" %
+                                  (os.path.relpath(path, project_dir), line, detail))
+    return issues
+
+
 def cmd_assets(drv, env, args, res):
+    issues = _lint_project_less(drv.dir, env)
+    res.check("legacy LESS preflight", not issues,
+              "; ".join(issues[:5]) if issues else "local LESS syntax is compatible")
+    if issues:
+        res.say("replace mixed-unit min()/max() with width plus min/max-width or height constraints")
+        return res
+    if args.sub == "lint":
+        return res
     # hub-assets [--clean]: no arg = compile only; --clean = clear then recompile
     cmd = ["hub-assets"] + (["--clean"] if args.sub == "clean" else [])
     r = drv.exec("web", cmd)
@@ -796,7 +949,61 @@ def cmd_cache(drv, env, args, res):
     return res
 
 
-ASSET_LINK_RE = re.compile(r'(?:href|src)="([^"]+\.(?:css|js)[^"]*)"')
+ASSET_LINK_RE = re.compile(
+    r"""(?:href|src)=["']([^"']+\.(?:css|js|png|jpe?g|gif|svg|webp|woff2?)(?:\?[^"']*)?)["']""",
+    re.I)
+CORE_COMPONENT_ROUTES = (
+    ("/resources", "com_resources"),
+    ("/groups", "com_groups"),
+    ("/members", "com_members"),
+    ("/search", "com_search"),
+    ("/support", "com_support"),
+)
+
+
+def _discover_menu_routes(drv, env):
+    prefix = env.get("DB_PREFIX", "jos_")
+    if not re.fullmatch(r"[A-Za-z0-9_]+", prefix):
+        return []
+    sql = (
+        "SELECT DISTINCT CASE WHEN home=1 THEN '/' ELSE CONCAT('/', path) END "
+        "FROM `%smenu` WHERE client_id=0 AND published=1 "
+        "AND menutype='mainmenu' AND type IN ('component','url') "
+        "AND (home=1 OR path <> '') ORDER BY 1" % prefix
+    )
+    r = drv.exec("db", ["sh", "-c",
+        'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" '
+        '"$MARIADB_DATABASE" --batch --skip-column-names -e "$1"',
+        "_", sql])
+    if r.returncode != 0:
+        return []
+    return [line.strip() for line in (r.stdout or "").splitlines()
+            if line.strip().startswith("/")]
+
+
+def _route_url(base, route):
+    route = route.strip()
+    if not route.startswith("/"):
+        route = "/" + route
+    return urllib.parse.urljoin(base.rstrip("/") + "/", route.lstrip("/"))
+
+
+def _sweep_page_assets(base, page_url, body):
+    links = sorted(set(ASSET_LINK_RE.findall(
+        body.decode("utf-8", "replace"))))
+    bad = []
+    base_host = urllib.parse.urlparse(base).netloc
+    for raw in links:
+        raw = html.unescape(raw)
+        if raw.startswith(("data:", "mailto:", "javascript:")):
+            continue
+        asset_url = urllib.parse.urljoin(page_url, raw)
+        if urllib.parse.urlparse(asset_url).netloc != base_host:
+            continue
+        code, _, _ = http_get(asset_url)
+        if code != 200:
+            bad.append("%s -> %s" % (raw, code))
+    return links, bad
 
 def cmd_verify(drv, env, args, res):
     base = drv.url()
@@ -809,26 +1016,38 @@ def cmd_verify(drv, env, args, res):
 
     if scope in ("all", "assets"):
         code, body, _ = http_get(base + "/app/cache/site/site.css")
-        big_enough = code == 200 and len(body) > 10000
-        res.check("compiled site.css", big_enough,
+        compiled = code == 200 and len(body) > 1000
+        res.check("compiled site.css", compiled,
                   "HTTP %s, %d bytes" % (code, len(body)))
-        if not big_enough:
+        if not compiled:
             res.suggest("cli/autohub assets build --json")
         code, _, _ = http_get(base + "/app/config/database.php")
         res.check("config is denied", code == 403, "HTTP %s (want 403)" % code)
-        # sweep: every css/js the homepage links must resolve
+        # Sweep every static asset linked by the homepage.
         code, body, _ = http_get(base + "/")
         if code == 200:
-            links = sorted(set(ASSET_LINK_RE.findall(body.decode("utf-8", "replace"))))
-            bad = []
-            for link in links:
-                if link.startswith("http"):
-                    continue
-                c, _, _ = http_get(base + link)
-                if c != 200:
-                    bad.append("%s -> %s" % (link, c))
+            links, bad = _sweep_page_assets(base, base + "/", body)
             res.check("homepage asset sweep (%d links)" % len(links),
                       not bad, "; ".join(bad[:5]))
+
+    if scope in ("all", "components"):
+        routes = [path for path, _component in CORE_COMPONENT_ROUTES]
+        routes.extend(_discover_menu_routes(drv, env))
+        routes.extend(getattr(args, "route", []) or [])
+        seen = set()
+        routes = [route for route in routes
+                  if not (route in seen or seen.add(route))]
+        res.say("native/menu route inventory: " + ", ".join(routes))
+        for route in routes:
+            url = _route_url(base, route)
+            code, body, _ = http_get(url)
+            usable = code == 200 and len(body) >= 200
+            res.check("component route %s" % route, usable,
+                      "HTTP %s, %d bytes" % (code, len(body)))
+            if usable:
+                links, bad = _sweep_page_assets(base, url, body)
+                res.check("route assets %s (%d links)" % (route, len(links)),
+                          not bad, "; ".join(bad[:5]))
 
     if scope in ("all", "mail"):
         r = drv.exec("web", ["bash", "-c",
@@ -844,7 +1063,8 @@ def cmd_verify(drv, env, args, res):
         user = env.get("HUB_ADMIN_USER")
         pw = env.get("HUB_ADMIN_PASSWORD")
         if user and pw:
-            res.check("admin login", _try_admin_login(base, user, pw))
+            ok, detail = _try_admin_login(base, user, pw)
+            res.check("admin login", ok, detail)
         else:
             res.check("admin login", False,
                       "not run: HUB_ADMIN_USER/PASSWORD missing from .env")
@@ -859,6 +1079,20 @@ def cmd_verify(drv, env, args, res):
     return res
 
 
+def _classify_admin_login_page(page):
+    token = re.search(r'name="([a-f0-9]{32})" value="1"', page, re.I)
+    if token:
+        return token.group(1), "login form and CSRF token found"
+    lower = page.lower()
+    if "consent" in lower and any(term in lower for term in
+                                  ("privacy", "terms", "agreement", "userconsent")):
+        return None, ("consent interstitial replaced the administrator login form; "
+                      "configure system/userconsent or intentionally disable it for this environment")
+    if 'name="username"' in lower or "com_login" in lower:
+        return None, "administrator login form found, but its CSRF token was not recognized"
+    return None, "administrator login form was not present in the response"
+
+
 def _try_admin_login(base, user, pw):
     """End-to-end /administrator login with the CSRF token dance."""
     ctx = ssl.create_default_context()
@@ -871,18 +1105,23 @@ def _try_admin_login(base, user, pw):
         urllib.request.HTTPCookieProcessor(jar))
     try:
         page = opener.open(base + "/administrator/index.php", timeout=25).read().decode("utf-8", "replace")
-        m = re.search(r'name="([a-f0-9]{32})" value="1"', page)
-        if not m:
-            return False
+        token, detail = _classify_admin_login_page(page)
+        if not token:
+            return False, detail
         data = urllib.parse.urlencode({
             "username": user, "passwd": pw,
-            "option": "com_login", "task": "login", m.group(1): "1",
+            "option": "com_login", "task": "login", token: "1",
         }).encode()
         opener.open(base + "/administrator/index.php", data=data, timeout=25)
         after = opener.open(base + "/administrator/index.php", timeout=25).read().decode("utf-8", "replace")
-        return "task=logout" in after or "Log out" in after
-    except Exception:
-        return False
+        if "task=logout" in after or "Log out" in after:
+            return True, "authenticated administrator session established"
+        if "invalid" in after.lower() and ("password" in after.lower() or
+                                           "username" in after.lower()):
+            return False, "login form rejected the configured administrator credentials"
+        return False, "login submission returned without an authenticated administrator session"
+    except Exception as exc:
+        return False, "administrator login request failed: %s" % scrub(str(exc))
 
 
 # doctor: log pattern -> known cause (seeded from the skill's troubleshooting
@@ -1061,6 +1300,86 @@ def cmd_admin(drv, env, args, res):
 
 TEMPLATES_DIR = "/var/www/html/app/templates"
 
+
+def _top_level_section(text, key):
+    match = re.search(r"(?m)^%s:[^\n]*\n?" % re.escape(key), text)
+    if not match:
+        return None
+    following = re.search(r"(?m)^[A-Za-z_][A-Za-z0-9_-]*:[^\n]*$",
+                          text[match.end():])
+    end = match.end() + following.start() if following else len(text)
+    return match.start(), match.end(), end
+
+
+def _upsert_local_template_manifest(text, name):
+    """Register and activate a local template without requiring a YAML library."""
+    text = text.rstrip() + "\n"
+    ext = _top_level_section(text, "extensions")
+    extension_lines = "  - type: template\n    alias: %s\n" % name
+    if ext is None:
+        text += "\nextensions:\n" + extension_lines
+    else:
+        _start, body_start, end = ext
+        block = text[body_start:end]
+        if not re.search(r"(?m)^\s+alias:\s*%s\s*$" % re.escape(name), block):
+            text = text[:body_start] + extension_lines + text[body_start:]
+
+    template = _top_level_section(text, "template")
+    if template is None:
+        text += "\ntemplate:\n  site: %s\n" % name
+    else:
+        start, body_start, end = template
+        header = text[start:body_start]
+        if re.match(r"template:\s*\{\s*\}\s*", header):
+            text = text[:start] + "template:\n  site: %s\n" % name + text[end:]
+        else:
+            block = text[body_start:end]
+            site = re.search(r"(?m)^(\s+)site:\s*[^\n]*$", block)
+            if site:
+                block = block[:site.start()] + site.group(1) + "site: " + name + block[site.end():]
+            else:
+                block = "  site: %s\n" % name + block
+            text = text[:body_start] + block + text[end:]
+    return text
+
+
+def _create_local_template(project_dir, name):
+    source = os.path.join(project_dir, "template-starter")
+    target = os.path.join(project_dir, "templates", name)
+    if not os.path.isdir(source):
+        raise Exception("project template-starter is missing")
+    if os.path.exists(target):
+        raise Exception("refusing to overwrite existing template: " + target)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    shutil.copytree(source, target)
+    label = re.sub(r"[-_]+", " ", name).title()
+    for root, _dirs, files in os.walk(target):
+        for filename in files:
+            path = os.path.join(root, filename)
+            try:
+                with open(path, encoding="utf-8") as stream:
+                    text = stream.read()
+            except (OSError, UnicodeError):
+                continue
+            text = text.replace("__TEMPLATE_NAME__", name)
+            text = text.replace("__TEMPLATE_LABEL__", label)
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write(text)
+    update_env(project_dir, {
+        "LOCAL_TEMPLATE_PATH": "./templates/" + name,
+        "LOCAL_TEMPLATE_NAME": name,
+    })
+    manifest_path = os.path.join(project_dir, "hub.yml")
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, encoding="utf-8", errors="replace") as stream:
+            manifest = stream.read()
+    else:
+        manifest = ""
+    with open(manifest_path, "w", encoding="utf-8") as stream:
+        stream.write(_upsert_local_template_manifest(manifest, name))
+    return target
+
+
 def _resolve_template(drv, name):
     if name:
         return name
@@ -1076,6 +1395,18 @@ def _resolve_template(drv, name):
 def cmd_template(drv, env, args, res):
     if args.name and not re.fullmatch(r"[A-Za-z0-9._-]+", args.name):
         res.fail("template name may contain only letters, digits, dot, underscore and hyphen")
+        return res
+    if args.sub == "create":
+        if drv.name != "docker":
+            res.fail("project-local template creation currently requires the Docker driver")
+            return res
+        if not args.name or not re.fullmatch(r"[a-z][a-z0-9_-]*", args.name):
+            res.fail("template create requires --name beginning with a lowercase letter")
+            return res
+        target = _create_local_template(drv.dir, args.name)
+        res.check("local template created", True, os.path.relpath(target, drv.dir))
+        res.say("hub.yml registers and activates %s; .env mounts its project source" % args.name)
+        res.suggest("cli/autohub assets lint --json")
         return res
     if args.branch and (args.branch.startswith("-") or ".." in args.branch or
                         not re.fullmatch(r"[A-Za-z0-9._/-]+", args.branch)):
@@ -1218,7 +1549,7 @@ def build_parser():
     add("provision", help="apply hub.yml").set_defaults(fn=cmd_provision)
 
     s = add("assets", help="template asset pipeline")
-    s.add_argument("sub", choices=["build", "clean"], nargs="?", default="build")
+    s.add_argument("sub", choices=["build", "clean", "lint"], nargs="?", default="build")
     s.set_defaults(fn=cmd_assets)
 
     s = add("cache", help="compiled-css / cms cache")
@@ -1228,7 +1559,9 @@ def build_parser():
 
     s = add("verify", help="prove the hub actually works")
     s.add_argument("--scope", default="all",
-                   choices=["all", "site", "assets", "mail", "login", "db"])
+                   choices=["all", "site", "assets", "components", "mail", "login", "db"])
+    s.add_argument("--route", action="append", default=[],
+                   help="additional public route to verify; repeat as needed")
     s.set_defaults(fn=cmd_verify)
 
     s = add("doctor", help="match recent logs against known failures")
@@ -1271,8 +1604,8 @@ def build_parser():
     s.add_argument("user")
     s.set_defaults(fn=cmd_admin)
 
-    s = add("template", help="template git repo: status / push")
-    s.add_argument("sub", choices=["status", "push"])
+    s = add("template", help="create a local template or manage its git repo")
+    s.add_argument("sub", choices=["create", "status", "push"])
     s.add_argument("--name", help="template dir under app/templates (auto if only one)")
     s.add_argument("--branch", help="branch to push (default: current)")
     s.add_argument("--token-env", default="GITLAB_TOKEN",

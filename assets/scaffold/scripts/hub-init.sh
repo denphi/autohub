@@ -24,6 +24,8 @@ TEMPLATE_URL=""
 TEMPLATE_BRANCH="main"
 HTTP_PORT=""
 HTTPS_PORT=""
+MAILPIT_PORT=""
+ADMINER_PORT=""
 PRESET=""
 FORCE=0
 INTERACTIVE=0
@@ -79,15 +81,82 @@ secret() {
 	head -c "$((n * 8))" /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | cut -c "1-${n}"
 }
 
-# First TCP port at or above $1 that nothing is listening on.
+# Return success only when the port can be bound on every available wildcard
+# interface. A localhost connect probe misses IPv6-only listeners and some
+# Docker Desktop reservations.
+port_available() {
+	python3 - "$1" <<'PY'
+import errno
+import re
+import socket
+import subprocess
+import sys
+
+port = int(sys.argv[1])
+try:
+    result = subprocess.run(
+        ["docker", "ps", "--format", "{{.Ports}}"],
+        capture_output=True, text=True, timeout=5
+    )
+    if result.returncode == 0:
+        published = {
+            int(value) for value in re.findall(
+                r"(?:0\.0\.0\.0|\[::\]):(\d+)->", result.stdout
+            )
+        }
+        if port in published:
+            sys.exit(1)
+except (OSError, subprocess.SubprocessError, ValueError):
+    pass
+
+families = [(socket.AF_INET, ("0.0.0.0", port))]
+if socket.has_ipv6:
+    families.append((socket.AF_INET6, ("::", port)))
+
+sockets = []
+try:
+    for family, address in families:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sockets.append(sock)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        if family == socket.AF_INET6:
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            except OSError:
+                pass
+        try:
+            sock.bind(address)
+        except OSError as exc:
+            if exc.errno in (errno.EPERM, errno.EACCES):
+                # Managed agent sandboxes may forbid bind probes. Docker's
+                # published-port inventory above remains authoritative there.
+                continue
+            if family == socket.AF_INET6 and exc.errno in (
+                errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL
+            ):
+                continue
+            raise
+except OSError:
+    sys.exit(1)
+finally:
+    for sock in sockets:
+        sock.close()
+PY
+}
+
+# First TCP port at or above $1 that can actually be published by Docker.
 free_port() {
 	local port="$1"
+	shift
 	while [ "$port" -lt 65535 ]; do
-		if ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+		local excluded=0 candidate
+		for candidate in "$@"; do
+			[ "$port" = "$candidate" ] && excluded=1
+		done
+		if [ "$excluded" = '0' ] && port_available "$port"; then
 			echo "$port"
 			return
 		fi
-		exec 3>&- 2>/dev/null || true
 		port=$((port + 1))
 	done
 	die "no free port found above $1"
@@ -109,6 +178,8 @@ ADMIN_EMAIL=$(ask "Administrator email" "${ADMIN_EMAIL:-admin@example.com}")
 
 [ -n "$HTTP_PORT" ]  || HTTP_PORT=$(free_port 8080)
 [ -n "$HTTPS_PORT" ] || HTTPS_PORT=$(free_port 8443)
+MAILPIT_PORT=$(free_port 8025 "$HTTP_PORT" "$HTTPS_PORT")
+ADMINER_PORT=$(free_port 8081 "$HTTP_PORT" "$HTTPS_PORT" "$MAILPIT_PORT")
 
 case "$ADMIN_EMAIL" in
 	*@*.*) ;;
@@ -125,26 +196,35 @@ else
 
 	# Every secret is generated. Nothing ships with a usable default.
 	AH_SITE="$SITE" AH_ADMIN_USER="$ADMIN_USER" AH_ADMIN_PASS="$ADMIN_PASS" \
-	AH_ADMIN_EMAIL="$ADMIN_EMAIL" AH_HTTP_PORT="$HTTP_PORT" AH_HTTPS_PORT="$HTTPS_PORT" \
-	AH_DB_PASS="$(secret 24)" AH_DB_ROOT_PASS="$(secret 24)" AH_APP_SECRET="$(secret 32)" \
-	python3 - <<'PY'
-import os, re
+		AH_ADMIN_EMAIL="$ADMIN_EMAIL" AH_HTTP_PORT="$HTTP_PORT" AH_HTTPS_PORT="$HTTPS_PORT" \
+		AH_MAILPIT_PORT="$MAILPIT_PORT" AH_ADMINER_PORT="$ADMINER_PORT" \
+		AH_DB_PASS="$(secret 24)" AH_DB_ROOT_PASS="$(secret 24)" AH_APP_SECRET="$(secret 32)" \
+		python3 - <<'PY'
+import hashlib, os, re
 site = os.environ['AH_SITE']
 au = os.environ['AH_ADMIN_USER']
 ap = os.environ['AH_ADMIN_PASS']
 ae = os.environ['AH_ADMIN_EMAIL']
 http = os.environ['AH_HTTP_PORT']
 https = os.environ['AH_HTTPS_PORT']
+mailpit = os.environ['AH_MAILPIT_PORT']
+adminer = os.environ['AH_ADMINER_PORT']
 dbpw = os.environ['AH_DB_PASS']
 rootpw = os.environ['AH_DB_ROOT_PASS']
 appsecret = os.environ['AH_APP_SECRET']
+slug = re.sub(r'[^a-z0-9]+', '-', site.lower()).strip('-') or 'autohub'
+digest = hashlib.sha256(os.path.realpath('.').encode()).hexdigest()[:8]
+compose_name = (slug[:40].rstrip('-') or 'autohub') + '-' + digest
 values = {
+    'COMPOSE_PROJECT_NAME': compose_name,
     'HUB_SITENAME': site,
     'HUB_ADMIN_USER': au,
     'HUB_ADMIN_PASSWORD': ap,
     'HUB_ADMIN_EMAIL': ae,
     'HTTP_PORT': http,
     'HTTPS_PORT': https,
+    'MAILPIT_PORT': mailpit,
+    'ADMINER_PORT': adminer,
     'DB_PASSWORD': dbpw,
     'DB_ROOT_PASSWORD': rootpw,
     'HUB_SECRET': appsecret,
