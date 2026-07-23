@@ -141,6 +141,16 @@ requested removal, take a full snapshot, identify a supported disable/removal
 operation, confirm the exact target and blast radius, persist any supported
 state in the manifest, and verify.
 
+Set CMS configuration through a reproducible source, never by hand-editing the
+rendered `app/config/*.php` files. Those files are generated on every boot and
+update by `hub-config-render` from layered inputs. Supply a value the hub lacks
+as a `HUBCFG_<group>__<key>` variable in `.env` (for example
+`HUBCFG_app__virus_scanner=…`), or through `hub.yml` when the provisioner maps
+that key. A value written directly into `app/config/app.php` is not part of the
+committed manifest, so it does not survive a rebuild into a fresh environment
+even when it survives a restart. If a required setting has no supported
+`.env`/`hub.yml` path, extend the provisioner rather than editing generated PHP.
+
 Do not make a live database edit the final fix. A diagnostic edit is incomplete
 until a reproducible manifest or provisioning mechanism exists.
 
