@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """autohub — one CLI for creating and maintaining a HUBzero hub.
 
-Design: DESIGN.md. This is M1: a thin, stdlib-only wrapper over the existing
+Design: references/design.md (CLI, drivers, verification, backups; requirements
+R1-R9). This is M1: a thin, stdlib-only wrapper over the existing
 scripts (scripts/hub-init.sh, in-container hub-*) behind a driver abstraction,
 with a machine-readable contract so a human, CI, or an AI Skill can drive it.
 
@@ -1143,7 +1144,7 @@ def cmd_assets(drv, env, args, res):
 
 def cmd_cache(drv, env, args, res):
     # `muse cache clear` removes app/cache/* (the per-client dirs incl. site.css).
-    # NOT `cache css clear`, which targets the wrong path (DESIGN.md R6).
+    # NOT `cache css clear`, which targets the wrong path (references/design.md R6).
     # hub-muse runs muse as www-data from HUB_ROOT — don't hardcode either.
     r = drv.exec("web", ["hub-muse", "cache", "clear"])
     out = (r.stdout or "") + (r.stderr or "")
@@ -1499,7 +1500,7 @@ def cmd_ext(drv, env, args, res):
             print(out)
     else:
         res.say("install/enable/disable land in hub.yml (extensions:), then `autohub provision` —")
-        res.say("provisioning clones, registers AND runs the extension's migrations (DESIGN.md R4)")
+        res.say("provisioning clones, registers AND runs the extension's migrations (references/design.md R4)")
         res.suggest("cli/autohub provision --json")
     return res
 
@@ -1609,8 +1610,11 @@ def _resolve_template(drv, name):
 
 
 def cmd_template(drv, env, args, res):
-    if args.name and not re.fullmatch(r"[A-Za-z0-9._-]+", args.name):
-        res.fail("template name may contain only letters, digits, dot, underscore and hyphen")
+    # Must begin with an alphanumeric so a bare "." or ".." can never survive to
+    # `TEMPLATES_DIR + "/" + name` and traverse out of the templates directory
+    # in the status/push paths (create is guarded separately below).
+    if args.name and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.name):
+        res.fail("template name must begin with a letter or digit and contain only letters, digits, dot, underscore and hyphen")
         return res
     if args.sub == "create":
         if drv.name != "docker":

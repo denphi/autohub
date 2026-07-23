@@ -359,6 +359,24 @@ class TemplateWorkflowTests(unittest.TestCase):
                              "./templates/researchhub")
             self.assertEqual(env["LOCAL_TEMPLATE_NAME"], "researchhub")
 
+    def test_template_status_rejects_path_traversal_names(self):
+        # A bare "." or ".." must never reach `TEMPLATES_DIR + "/" + name` and
+        # escape the templates directory (git status/push on the wrong repo).
+        class TraversalDriver(FakeDriver):
+            def exec(self, service, command, **_kwargs):
+                raise AssertionError(
+                    "traversal name must be rejected before any container exec")
+
+        for unsafe in ("..", "."):
+            args = type("Args", (), {
+                "sub": "status", "name": unsafe, "branch": None,
+                "token_env": "GITLAB_TOKEN", "force": False,
+            })()
+            result = autohub.Result("template")
+            autohub.cmd_template(TraversalDriver("/nonexistent"), {}, args, result)
+            self.assertFalse(result.ok)
+            self.assertIn("begin with a letter or digit", result.details[-1])
+
     def test_legacy_less_lint_rejects_mixed_unit_css_math(self):
         issues = autohub._lint_less_text(
             ".hero { width: min(100%, 72rem); max-width: max(20px, 2rem); }")

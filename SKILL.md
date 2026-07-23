@@ -8,6 +8,9 @@ description: Create, deploy, diagnose, back up, restore, upgrade, and safely mai
 Resolve `<skill-dir>` to the directory containing this `SKILL.md`. Keep the
 bundled project under `assets/scaffold/` immutable; create a working project
 from it or operate an existing project that already contains `cli/autohub`.
+Run `<skill-dir>/scripts/*` from anywhere with an absolute path; run
+`cli/autohub` from inside the working project directory (or pass
+`--project-dir`), never from `<skill-dir>`.
 
 Use `--json` for every non-streaming AutoHub command. Treat its
 `{ok, action, details, checks, next, data?}` object and exit status as the contract.
@@ -16,8 +19,9 @@ while a required check failed, was skipped, or still needs visual inspection.
 
 ## Route the task
 
-- For a new hub or project, scaffold first and follow **Create a hub**.
-- For an existing AutoHub project, start with **Establish the target**.
+- For a new hub or project, scaffold first and follow **Create a project**.
+- For an existing AutoHub project, start with **Establish the target and
+  baseline**.
 - For a broken page or service, use **Diagnose a hub** before changing state.
 - For configuration, template, upgrade, reset, backup, or restore work, follow
   the corresponding guarded workflow below.
