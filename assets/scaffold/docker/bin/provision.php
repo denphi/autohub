@@ -777,6 +777,160 @@ if (!empty($manifest['resources']))
 }
 
 // ---------------------------------------------------------------------------
+// Articles (native com_content pages)
+// ---------------------------------------------------------------------------
+if (!empty($manifest['articles']))
+{
+	section('articles');
+
+	foreach ($manifest['articles'] as $article)
+	{
+		$title = isset($article['title']) ? trim((string) $article['title']) : '';
+		$alias = isset($article['alias'])
+			? trim((string) $article['alias'])
+			: trim(strtolower(preg_replace('/[^a-z0-9]+/i', '-', $title)), '-');
+
+		if (!$title || !$alias)
+		{
+			$failed++;
+			fwrite(STDERR, "[hub]   FAILED article: needs a 'title' and an 'alias'\n");
+			continue;
+		}
+
+		attempt("article {$alias}", function () use ($article, $title, $alias, $db)
+		{
+			$id = isset($article['id']) ? (int) $article['id'] : 0;
+
+			// A pinned id must not overwrite an unrelated article or conflict with
+			// the same alias at another id.
+			if ($id)
+			{
+				$db->setQuery("SELECT `alias` FROM `#__content` WHERE `id` = " . $id);
+				$idAlias = $db->loadResult();
+
+				if ($idAlias !== null && $idAlias !== $alias)
+				{
+					throw new Exception("id {$id} belongs to article '{$idAlias}'");
+				}
+			}
+
+			$db->setQuery("SELECT `id` FROM `#__content` WHERE `alias` = " . $db->quote($alias));
+			$aliasId = (int) $db->loadResult();
+
+			if ($id && $aliasId && $aliasId !== $id)
+			{
+				throw new Exception("alias '{$alias}' belongs to article id {$aliasId}, not {$id}");
+			}
+
+			$existing = $id
+				? ($idAlias !== null ? $id : 0)
+				: $aliasId;
+
+			$category = isset($article['category']) ? $article['category'] : 'uncategorised';
+
+			if (is_numeric($category))
+			{
+				$catId = (int) $category;
+				$db->setQuery("SELECT `id` FROM `#__categories`
+					WHERE `id` = " . $catId . " AND `extension` = 'com_content'");
+			}
+			else
+			{
+				$db->setQuery("SELECT `id` FROM `#__categories`
+					WHERE `extension` = 'com_content' AND `alias` = " . $db->quote((string) $category));
+			}
+
+			$catId = (int) $db->loadResult();
+
+			if (!$catId)
+			{
+				throw new Exception("unknown com_content category '{$category}'");
+			}
+
+			$content = array_key_exists('content', $article)
+				? $article['content']
+				: (isset($article['introtext']) ? $article['introtext'] : '');
+			$attribs = isset($article['attribs']) ? $article['attribs']
+				: (isset($article['params']) ? $article['params'] : array());
+			$metadata = isset($article['metadata']) ? $article['metadata'] : array();
+
+			if (is_array($attribs))
+			{
+				$attribs = json_encode($attribs);
+			}
+
+			if (is_array($metadata))
+			{
+				$metadata = json_encode($metadata);
+			}
+
+			$fields = array(
+				'title'       => $title,
+				'alias'       => $alias,
+				'introtext'   => $content,
+				'fulltext'    => isset($article['fulltext']) ? $article['fulltext'] : '',
+				'state'       => isset($article['state']) ? (int) $article['state']
+					: (isset($article['published']) ? (int) $article['published'] : 1),
+				'catid'       => $catId,
+				'created_by'  => isset($article['created_by']) ? (int) $article['created_by'] : 0,
+				'access'      => isset($article['access']) ? (int) $article['access'] : 1,
+				'language'    => isset($article['language']) ? $article['language'] : '*',
+				'attribs'     => (string) $attribs,
+				'metadata'    => (string) $metadata,
+				'metakey'     => isset($article['metakey']) ? $article['metakey'] : '',
+				'metadesc'    => isset($article['metadesc']) ? $article['metadesc'] : '',
+				'images'      => isset($article['images']) ? $article['images'] : '',
+				'urls'        => isset($article['urls']) ? $article['urls'] : '',
+				'xreference'  => isset($article['xreference']) ? $article['xreference'] : '',
+			);
+
+			$set = array();
+
+			foreach ($fields as $column => $value)
+			{
+				$set[] = '`' . $column . '` = ' . $db->quote($value);
+			}
+
+			if ($existing)
+			{
+				$db->setQuery("UPDATE `#__content` SET " . implode(', ', $set)
+					. " WHERE `id` = " . (int) $existing);
+			}
+			else
+			{
+				if ($id)
+				{
+					$set[] = '`id` = ' . $id;
+				}
+
+				$now = $db->quote(gmdate('Y-m-d H:i:s'));
+				$set[] = '`created` = ' . $now;
+				$set[] = '`publish_up` = ' . $now;
+				$db->setQuery("INSERT INTO `#__content` SET " . implode(', ', $set));
+			}
+
+			$db->query();
+
+			$articleId = $existing ? (int) $existing : ($id ?: (int) $db->insertid());
+			require_once Component::path('com_content') . '/models/article.php';
+			$model = Components\Content\Models\Article::one($articleId);
+			$assetId = Hubzero\Database\Asset::resolve($model);
+
+			if (!$assetId)
+			{
+				throw new Exception("could not create the com_content permission asset");
+			}
+
+			$db->setQuery("UPDATE `#__content` SET `asset_id` = " . (int) $assetId
+				. " WHERE `id` = " . $articleId);
+			$db->query();
+
+			return true;
+		});
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Users
 // ---------------------------------------------------------------------------
 if (!empty($manifest['users']))
@@ -923,9 +1077,33 @@ function menuItem($db, $item, $type, $client, $order, $parentId, $parentPath, $l
     $title = isset($item['title']) ? $item['title'] : '';
     $alias = isset($item['alias']) ? $item['alias'] : strtolower(str_replace(' ', '-', $title));
 
+    // `article: alias` keeps menu declarations independent of database ids and
+    // guarantees the route is backed by native com_content rather than a PHP
+    // file hidden inside the template.
+    if (!empty($item['article']))
+    {
+        if ($client !== 0)
+        {
+            throw new Exception("article menu shorthand is only valid for site menus");
+        }
+
+        $articleAlias = trim((string) $item['article']);
+        $db->setQuery("SELECT `id` FROM `#__content`
+            WHERE `alias` = " . $db->quote($articleAlias) . " AND `state` = 1");
+        $articleId = (int) $db->loadResult();
+
+        if (!$articleId)
+        {
+            throw new Exception("references missing or unpublished article '{$articleAlias}'");
+        }
+
+        $item['link'] = 'index.php?option=com_content&view=article&id=' . $articleId;
+        $item['type'] = 'component';
+    }
+
     if (!$title || empty($item['link']))
     {
-        throw new Exception("menu item needs a 'title' and a 'link'");
+        throw new Exception("menu item needs a 'title' and either a 'link' or 'article'");
     }
 
     $itemType = isset($item['type']) ? $item['type'] : 'component';

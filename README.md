@@ -16,6 +16,7 @@ JSON results, deployment-driver abstraction, and safety checks.
 - Establishes a health baseline before changing an existing hub.
 - Diagnoses site, asset, mail, login, and database failures.
 - Applies declarative hub configuration from `hub.yml`.
+- Provisions editable native articles and connects menu routes by article alias.
 - Builds template assets and requires browser verification for visual changes.
 - Creates coordinated database, application-data, TLS, source, and
   configuration snapshots.

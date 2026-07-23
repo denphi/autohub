@@ -150,5 +150,30 @@ class SafetyTests(unittest.TestCase):
             self.assertTrue(driver.destroyed)
 
 
+class ContentProvisioningTests(unittest.TestCase):
+    def test_scaffold_provisions_native_articles(self):
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, "docker", "bin", "provision.php"),
+                  encoding="utf-8") as f:
+            provisioner = f.read()
+        with open(os.path.join(root, "hub.yml.example"), encoding="utf-8") as f:
+            manifest = f.read()
+
+        self.assertIn("$manifest['articles']", provisioner)
+        self.assertIn("INSERT INTO `#__content`", provisioner)
+        self.assertIn("Hubzero\\Database\\Asset::resolve", provisioner)
+        self.assertIn("!empty($item['article'])", provisioner)
+        self.assertIn("articles:\n", manifest)
+        self.assertIn("article: home", manifest)
+
+    def test_template_pages_are_not_a_manifest_content_pattern(self):
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, "hub.yml.example"), encoding="utf-8") as f:
+            manifest = f.read()
+
+        self.assertNotIn("type: Pages", manifest)
+        self.assertNotIn("templates/pages", manifest)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ root.
 - [Commands](#commands)
 - [Configuration](#configuration)
 - [Declaring the hub](#declaring-the-hub-hubyml)
+- [Native articles and templates](#native-articles-and-template-boundary)
 - [First boot](#how-first-boot-installs-the-hub)
 - [Upstream behaviors](#four-upstream-behaviours-that-will-surprise-you)
 - [Production notes](#production-notes)
@@ -191,6 +192,37 @@ Rules that make it safe to run unattended:
 
 Division of labour: **`.env` owns infrastructure** (ports, database, TLS, mail,
 debug); **`hub.yml` owns the hub** (extensions, template, plugins, content).
+
+## Native articles and template boundary
+
+Provision homepage copy, about/help/policy pages, news, and other general prose
+as native `com_content` records:
+
+```yaml
+articles:
+  - title: Home
+    alias: home
+    content: |
+      <h1>Welcome</h1>
+      <p>This content remains editable in Article Manager.</p>
+    attribs: { show_title: 0 }
+
+menus:
+  site:
+    items:
+      - { title: Home, alias: home, article: home, home: true }
+```
+
+The `article:` menu shorthand resolves a published article by alias and creates
+the normal `com_content` link. Datasets, tools, and publications remain
+`resources:`; communities remain `groups:`.
+
+A template owns shared presentation, assets, module positions, and optional
+component markup overrides. It must render the component buffer. Do not put
+site pages in template-side `pages/*.php` files, dispatch page content from
+`index.php`, or store the content catalog in PHP arrays. See
+[content and template architecture](content-and-templates.md) for the full
+mapping and verification checklist.
 
 ### Replicating an existing hub
 

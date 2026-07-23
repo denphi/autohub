@@ -91,8 +91,30 @@ resource_types:
   - { id: 3, alias: tools,        type: Tools,        category: 27, state: 1 }
 
 # --- Example content --------------------------------------------------------
-# Matched on title, so editing one here updates rather than duplicates it.
-# `type` is a resource_type alias from above.
+# General site pages belong in native com_content articles, not PHP files in a
+# template. They remain editable through Content > Article Manager. Articles
+# are matched on alias; `content` is the complete body for a single-page item.
+articles:
+  - title: Home
+    alias: home
+    category: uncategorised
+    content: |
+      <h1>Welcome to this hub</h1>
+      <p>Replace this example with the hub's declarative homepage content.</p>
+    attribs:
+      show_title: 0
+    metadesc: Example HUBzero homepage provisioned from hub.yml.
+
+  - title: About
+    alias: about
+    category: uncategorised
+    content: |
+      <h1>About this hub</h1>
+      <p>Describe the hub's mission, community, and governance here.</p>
+
+# Datasets, tools, publications, and other catalogued research objects belong
+# in com_resources. Matched on title, so editing one updates rather than
+# duplicates it. `type` is a resource_type alias from above.
 resources:
   - title: Example Simulation Tool
     type: tools
@@ -147,7 +169,7 @@ menus:
     items:
       - title: Home
         alias: home
-        link: index.php?option=com_resources
+        article: home          # resolves to a native com_content article by alias
         home: true
 
       - title: Explore
@@ -155,7 +177,7 @@ menus:
         link: index.php?option=com_resources
         children:
           - { title: Tools,     alias: tools,     link: /resources/tools, type: url }
-          - { title: Resources, alias: resources, link: index.php?option=com_resources }
+          - { title: Resources, alias: resources, link: "index.php?option=com_resources" }
 
 # A component link (the default `type`) is resolved to its component_id.
 # Leaving that unset does not merely lose metadata -- the router then serves a

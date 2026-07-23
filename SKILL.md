@@ -25,6 +25,9 @@ while a required check failed, was skipped, or still needs visual inspection.
   project layout, first-boot behavior, and production notes.
 - Read [references/design.md](references/design.md) when changing the CLI,
   driver abstraction, manifest behavior, verification, or backup architecture.
+- Read [references/content-and-templates.md](references/content-and-templates.md)
+  before creating site pages, navigation, a custom template, or a substantial
+  content catalog.
 
 ## Create a project
 
@@ -117,6 +120,45 @@ state in the manifest, and verify.
 
 Do not make a live database edit the final fix. A diagnostic edit is incomplete
 until a reproducible manifest or provisioning mechanism exists.
+
+## Build site content and templates
+
+Keep content and presentation separate. Provision ordinary pages, homepage
+copy, policies, news, and learning articles through the `articles:` section of
+`hub.yml`. Provision datasets, tools, publications, and other catalogued
+research objects through `resources:`; communities through `groups:`; and
+routes through `menus:`. Use `article: <alias>` on a menu item to resolve a
+native article without hard-coding its database id.
+
+Treat the active template as presentation chrome only. Its `index.php` must
+render the component buffer and module positions; it must not dispatch on the
+request path or menu alias, include a `pages/*.php` tree, hold a hard-coded
+content catalog, or replace native components with page-specific PHP. Put
+reusable styling, layout, images, JavaScript, module chrome, and narrowly scoped
+HTML overrides in the template. Keep editable prose and records in native
+HUBzero content.
+
+Before provisioning, write down the mapping from each requested item to its
+native owner (`articles`, `resources`, `groups`, `menus`, or another installed
+component). If the manifest lacks a required native content surface, extend
+the provisioner and its tests instead of hiding the content in the template.
+
+For a content-rich build, run the deterministic boundary audit before
+provisioning:
+
+```bash
+python3 <skill-dir>/scripts/audit_site_architecture.py \
+  <project-directory> --require-native-content --json
+```
+
+Treat any failed check as blocking. Fix the ownership violation rather than
+weakening or bypassing the audit.
+
+After provisioning, confirm that article aliases exist in `#__content`, menu
+items point to `com_content`, resources exist in `#__resources`, and each route
+renders through the active component. Content is incomplete if it exists only
+as a file beneath the template or cannot be edited through the appropriate
+administrator component.
 
 ## Change templates and styles
 

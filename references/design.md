@@ -322,6 +322,9 @@ project lives under `assets/scaffold/`.
   → `verify` inside the generated project.
 - Day-2 work starts with a `status`/`verify` baseline, then narrows through
   `doctor`, error logs, scoped verification, and read-only DB queries.
+- Content-rich site builds map ordinary pages to native `com_content` articles,
+  research objects to resources, communities to groups, and routes to menus;
+  templates render those components instead of becoming page routers.
 - Reset, forced initialization, and restoration resolve an exact target and
   require a host-side recovery point outside the volumes/PVCs being changed.
 - Visual work requires browser QA; database-only dumps and CronJobs remain
