@@ -8,6 +8,7 @@ import os
 import shutil
 import stat
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -182,6 +183,105 @@ class ContentProvisioningTests(unittest.TestCase):
 
         self.assertNotIn("type: Pages", manifest)
         self.assertNotIn("templates/pages", manifest)
+
+    def test_native_component_framework_is_present_and_content_is_read_only(self):
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, "docker-compose.yml"), encoding="utf-8") as f:
+            compose = f.read()
+        with open(os.path.join(root, "docker", "bin", "components",
+                               "provision.php"), encoding="utf-8") as f:
+            provisioner = f.read()
+
+        self.assertIn("${HUB_CONTENT_PATH:-./content}:/etc/hubzero/content:ro",
+                      compose)
+        self.assertIn("autohub_import_file", provisioner)
+        self.assertIn("realpath", provisioner)
+        self.assertIn("HUB_COMPONENT_AUTHORIZATION", provisioner)
+        self.assertIn("Components\\Projects\\Models\\Repo", provisioner)
+        self.assertIn("publication_version_id", provisioner)
+        self.assertIn("#__courses_asset_associations", provisioner)
+
+
+class ComponentCommandTests(unittest.TestCase):
+    def test_all_four_component_command_families_share_the_contract(self):
+        parser = autohub.build_parser()
+        for domain in ("project", "resource", "publication", "course"):
+            args = parser.parse_args([
+                domain, "plan", "--max-items", "3", "--json"])
+            self.assertEqual(args.cmd, domain)
+            self.assertEqual(args.sub, "plan")
+            self.assertEqual(args.max_items, 3)
+            self.assertIsNone(args.id)
+            self.assertIs(args.fn, autohub.cmd_component)
+
+    def test_result_emits_optional_structured_data(self):
+        result = autohub.Result("publication")
+        result.data = {"changes": {"create": ["example"]}}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result.emit(True)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["data"]["changes"]["create"], ["example"])
+
+    def test_apply_requires_every_authorization_reported_by_plan(self):
+        class ComponentDriver(FakeDriver):
+            def url(self):
+                return "https://localhost:8443"
+
+            def exec(self, service, command, **_kwargs):
+                if command[0] == "hub-component" and command[2] == "plan":
+                    domain = command[1]
+                    payload = {
+                        "ok": True,
+                        "authorization": ["publish"] if domain == "publication" else [],
+                        "errors": [],
+                        "checks": [],
+                        "data": {"changes": {
+                            "create": ["example"] if domain == "publication" else []}},
+                    }
+                    return subprocess.CompletedProcess(
+                        command, 0, json.dumps(payload), "")
+                raise AssertionError("apply must stop before mutation")
+
+        with tempfile.TemporaryDirectory() as project:
+            with open(os.path.join(project, "hub.yml"), "w",
+                      encoding="utf-8") as stream:
+                stream.write("publications: []\n")
+            args = type("Args", (), {
+                "cmd": "publication", "sub": "apply", "manifest": "hub.yml",
+                "max_items": 3, "alias": None, "id": None, "authorize": [],
+            })()
+            result = autohub.Result("publication")
+            autohub.cmd_component(ComponentDriver(project), {}, args, result)
+            self.assertFalse(result.ok)
+            self.assertIn("--authorize", result.details[-1])
+
+    def test_kubernetes_stages_only_files_beneath_content_root(self):
+        class KubernetesStageDriver(FakeDriver):
+            name = "kubernetes"
+
+            def target_id(self):
+                return "kubernetes:test:autohub"
+
+            def stream_from_file(self, service, command, path):
+                with tarfile.open(path, "r:gz") as bundle:
+                    self.members = bundle.getnames()
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as project:
+            content = os.path.join(project, "content")
+            os.makedirs(content)
+            source = os.path.join(content, "observations.csv")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write("flower,pollinator\n")
+            driver = KubernetesStageDriver(project)
+            result = autohub.Result("resource")
+            destination = autohub._stage_kubernetes_component_files(
+                driver, {"HUB_CONTENT_PATH": "./content"},
+                [{"path": "content/observations.csv"}], result)
+            self.assertTrue(destination.startswith("/tmp/autohub-content-"))
+            self.assertEqual(driver.members, ["observations.csv"])
+            self.assertFalse(result.verify_failed)
 
 
 class InitializationTests(unittest.TestCase):

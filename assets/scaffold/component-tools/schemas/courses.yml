@@ -1,0 +1,18 @@
+section: courses
+required: [alias, title]
+fields:
+  alias: { type: string, pattern: "^[a-z0-9][a-z0-9-]*$" }
+  title: { type: string }
+  description: { type: string }
+  blurb: { type: string }
+  state: { enum: [draft, published], publish_authorization: publish }
+  access: { type: integer, authorization: access-change }
+  length: { type: string }
+  effort: { type: string }
+  units:
+    type: list
+    item:
+      required: [alias, title]
+      asset_types: [content, url, resource, publication]
+enrollment_and_learner_data: unmanaged
+deletion: unsupported

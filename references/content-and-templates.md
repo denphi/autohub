@@ -22,7 +22,10 @@ Classify every requested page or record before writing code.
 |---|---|---|
 | Homepage copy, about, policies, help, landing pages | `com_content` article | `articles:` |
 | News or durable educational prose | `com_content` article | `articles:` |
-| Dataset, tool, publication, downloadable research object | `com_resources` | `resource_types:` and `resources:` |
+| Dataset, tool, downloadable research object | `com_resources` | `resource_types:` and `resources:` |
+| Versioned publication or image publication | `com_publications` | `projects:` and `publications:` |
+| Course, unit, or learning asset | `com_courses` | `courses:` |
+| Research team workspace | `com_projects` | `projects:` |
 | Research community | `com_groups` | `groups:` |
 | User/account | `com_members` / `com_users` | component configuration and `users:` |
 | Primary navigation and route aliases | `com_menus` | `menus:` |

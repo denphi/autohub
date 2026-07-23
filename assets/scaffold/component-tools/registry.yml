@@ -1,0 +1,23 @@
+version: 1
+apply_order: [projects, resources, publications, courses]
+adapters:
+  project:
+    component: com_projects
+    manifest_section: projects
+    schema: schemas/projects.yml
+    natural_key: alias
+  resource:
+    component: com_resources
+    manifest_section: resources
+    schema: schemas/resources.yml
+    natural_key: alias
+  publication:
+    component: com_publications
+    manifest_section: publications
+    schema: schemas/publications.yml
+    natural_key: alias
+  course:
+    component: com_courses
+    manifest_section: courses
+    schema: schemas/courses.yml
+    natural_key: alias

@@ -197,7 +197,7 @@ The Makefile stays as a thin human convenience; the CLI is the contract.
 - **Non-interactive by default.** Prompts only behind `--interactive`.
   (`hub-init.sh` already follows this.)
 - **`--json` on every command.** Human text on stdout by default; with
-  `--json`, a single JSON object: `{ok, action, details, checks[], next[]}` —
+  `--json`, a single JSON object: `{ok, action, details, checks[], next[], data?}` —
   `next[]` is a list of suggested follow-up commands, which is what lets an
   agent chain operations without hardcoded playbooks.
 - **Exit codes:** 0 ok · 1 operation failed · 2 verification failed after an

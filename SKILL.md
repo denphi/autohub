@@ -10,7 +10,7 @@ bundled project under `assets/scaffold/` immutable; create a working project
 from it or operate an existing project that already contains `cli/autohub`.
 
 Use `--json` for every non-streaming AutoHub command. Treat its
-`{ok, action, details, checks, next}` object and exit status as the contract.
+`{ok, action, details, checks, next, data?}` object and exit status as the contract.
 Never infer success from a command merely finishing, and never report success
 while a required check failed, was skipped, or still needs visual inspection.
 
@@ -25,6 +25,8 @@ while a required check failed, was skipped, or still needs visual inspection.
   project layout, first-boot behavior, and production notes.
 - Read [references/design.md](references/design.md) when changing the CLI,
   driver abstraction, manifest behavior, verification, or backup architecture.
+- Read [DESIGN.md](DESIGN.md) for the implemented Projects, Resources,
+  Publications, and Courses adapter contract.
 - Read [references/content-and-templates.md](references/content-and-templates.md)
   before creating site pages, navigation, a custom template, or a substantial
   content catalog.
@@ -138,14 +140,75 @@ state in the manifest, and verify.
 Do not make a live database edit the final fix. A diagnostic edit is incomplete
 until a reproducible manifest or provisioning mechanism exists.
 
+## Build native projects, resources, publications, and courses
+
+Translate ordinary user language to the native owner before writing content:
+
+| User intent | Native owner | Command |
+|---|---|---|
+| Team workspace or publication owner | `com_projects` | `project` |
+| Dataset, tool, download, or catalogued research object | `com_resources` | `resource` |
+| Authored, versioned research output or image record | `com_publications` | `publication` |
+| Course, unit, reading, or linked learning sequence | `com_courses` | `course` |
+
+Do not ask the user to name these components. Infer the owner, then discover
+the live capability before creating the manifest section:
+
+```bash
+cli/autohub <project|resource|publication|course> describe --json
+cli/autohub <project|resource|publication|course> inspect --json
+```
+
+Use the description's supported fields and limitations; do not invent a
+column, lifecycle state, category, license, or asset type. Put files under the
+project's `content/` directory and reference them from `hub.yml` as
+`content/<relative-path>`. Never copy an arbitrary absolute path into component
+storage. The adapter rejects traversal, escaping symlinks, executable content,
+oversize files, MIME mismatches, and undecodable images.
+
+Declare dependencies and apply them in this order:
+
+```text
+users/groups -> projects -> resources -> publications -> courses
+```
+
+Project aliases on the pinned HUBzero revision must contain 3–30 lowercase
+alphanumeric characters; the other native aliases may also contain hyphens.
+Publications require a declared or existing project and author. Courses may
+link to a declared or existing resource or publication. Prefer a draft unless
+the user clearly requested publication.
+
+Always review the component plan before mutation:
+
+```bash
+cli/autohub <domain> plan --manifest hub.yml --max-items <requested-limit> --json
+cli/autohub <domain> apply --manifest hub.yml --max-items <requested-limit> --json
+cli/autohub <domain> verify --manifest hub.yml --json
+cli/autohub verify --scope components --json
+```
+
+Pass each exact `--authorize <value>` reported by the plan only when the user
+authorized that transition. Publishing, access changes, team changes, and
+archival are separate authorizations. Never infer deletion from an absent
+manifest item. Do not enroll users, change grades/progress, remove team members
+or authors, replace published files, withdraw publications, or remove
+units/assets through these additive tools.
+
+After applying, inspect the populated native list and detail routes in a
+browser at desktop and mobile widths. Confirm the requested records, metadata,
+files/images, navigation, and relevant owner/editor state render through the
+native component. HTTP success alone is insufficient.
+
 ## Build site content and templates
 
 Keep content and presentation separate. Provision ordinary pages, homepage
 copy, policies, news, and learning articles through the `articles:` section of
-`hub.yml`. Provision datasets, tools, publications, and other catalogued
-research objects through `resources:`; communities through `groups:`; and
-routes through `menus:`. Use `article: <alias>` on a menu item to resolve a
-native article without hard-coding its database id.
+`hub.yml`. Use `resources:` for datasets, tools, downloads, and catalogued
+research objects; `publications:` for native versioned publications;
+`courses:` for native learning hierarchies; `projects:` for their team
+workspaces; `groups:` for communities; and `menus:` for routes. Use
+`article: <alias>` on a menu item to resolve a native article without
+hard-coding its database id.
 
 Treat the active template as presentation chrome only. Its `index.php` must
 render the component buffer and module positions; it must not dispatch on the
@@ -156,9 +219,10 @@ HTML overrides in the template. Keep editable prose and records in native
 HUBzero content.
 
 Before provisioning, write down the mapping from each requested item to its
-native owner (`articles`, `resources`, `groups`, `menus`, or another installed
-component). If the manifest lacks a required native content surface, extend
-the provisioner and its tests instead of hiding the content in the template.
+native owner (`articles`, `projects`, `resources`, `publications`, `courses`,
+`groups`, or `menus`). If the manifest lacks a required native content surface,
+extend the provisioner and its tests instead of hiding the content in the
+template.
 
 For a content-rich build, run the deterministic boundary audit before
 provisioning:

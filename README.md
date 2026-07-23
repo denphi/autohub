@@ -18,6 +18,8 @@ JSON results, deployment-driver abstraction, and safety checks.
 - Establishes a health baseline before changing an existing hub.
 - Diagnoses site, asset, mail, login, and database failures.
 - Applies declarative hub configuration from `hub.yml`.
+- Plans, applies, inspects, verifies, and exports native Projects, Resources,
+  Publications, and Courses records through component-aware commands.
 - Provisions editable native articles and connects menu routes by article alias.
 - Generates project-local templates with a native-component-first style
   baseline and no manual Compose edits.
@@ -142,12 +144,31 @@ without rebuilding the runtime image.
 Provisioning is idempotent and additive-only. Removing an entry from `hub.yml`
 does not delete the corresponding live object.
 
+## Native component tools
+
+Projects, Resources, Publications, and Courses share a discoverable workflow:
+
+```bash
+cli/autohub publication describe --json
+cli/autohub publication inspect --json
+cli/autohub publication plan --manifest hub.yml --max-items 3 --json
+cli/autohub publication apply --manifest hub.yml --max-items 3 --json
+cli/autohub publication verify --manifest hub.yml --json
+```
+
+Replace `publication` with `project`, `resource`, or `course`. `plan` reports
+creates, updates, unchanged records, dependencies, files, checks, and sensitive
+transitions. Pass a reported `--authorize` value to `apply` only when that
+transition was requested. Approved Resource and Publication files live under
+the generated project's `content/` directory and are validated before being
+copied into native component storage.
+
 ## Safety model
 
 AutoHub treats operational verification as part of every change:
 
 - Non-streaming commands support `--json` and return one
-  `{ok, action, details, checks, next}` object.
+  `{ok, action, details, checks, next, data?}` object.
 - Destructive commands require explicit authorization, `--force`, and the
   resolved target identifier.
 - Risky operations require a completed recovery point outside the storage being
@@ -168,6 +189,7 @@ AutoHub treats operational verification as part of every change:
 | Path | Purpose |
 |---|---|
 | [`SKILL.md`](SKILL.md) | Agent workflow, routing, safety rules, and operating invariants |
+| [`DESIGN.md`](DESIGN.md) | Implemented component-aware tooling and adapter priorities |
 | [`scripts/create_project.py`](scripts/create_project.py) | Copies the bundled scaffold into a new project |
 | [`assets/scaffold/`](assets/scaffold/) | Docker, Kubernetes, CLI, provisioning, and initialization assets |
 | [`references/scaffold.md`](references/scaffold.md) | Generated-project setup, configuration, first boot, and production reference |
@@ -193,6 +215,7 @@ cluster configuration.
 ## Further reading
 
 - [Skill operating instructions](SKILL.md)
+- [Core component tools design](DESIGN.md)
 - [Scaffold and deployment reference](references/scaffold.md)
 - [Architecture and design](references/design.md)
 - [Open Agent Skills specification](https://agentskills.io/specification)

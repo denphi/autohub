@@ -7,7 +7,7 @@ with a machine-readable contract so a human, CI, or an AI Skill can drive it.
 
 Contract:
   - non-interactive by default
-  - `--json` prints exactly one JSON object: {ok, action, details, checks, next}
+  - `--json` prints exactly one JSON object: {ok, action, details, checks, next, data?}
   - exit codes: 0 ok · 1 operation failed · 2 verification failed · 3 bad usage
   - idempotent where the wrapped operation allows it
   - no secrets in argv or output
@@ -30,6 +30,8 @@ import socket
 import ssl
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 import urllib.request
 import urllib.parse
@@ -420,6 +422,7 @@ class Result:
         self.details = []          # human-readable lines
         self.checks = []           # {name, ok, info}
         self.next = []             # suggested follow-up commands
+        self.data = None           # optional structured domain result
         self.verify_failed = False
 
     def say(self, line):
@@ -448,13 +451,16 @@ class Result:
 
     def emit(self, as_json):
         if as_json:
-            print(json.dumps({
+            payload = {
                 "ok": self.ok and not self.verify_failed,
                 "action": self.action,
                 "details": self.details,
                 "checks": self.checks,
                 "next": self.next,
-            }, indent=2))
+            }
+            if self.data is not None:
+                payload["data"] = self.data
+            print(json.dumps(payload, indent=2))
         else:
             for d in self.details:
                 print(d)
@@ -1713,6 +1719,220 @@ def cmd_muse(drv, env, args, res):
     return res
 
 
+COMPONENT_SECTIONS = {
+    "project": "projects",
+    "resource": "resources",
+    "publication": "publications",
+    "course": "courses",
+}
+COMPONENT_DEPENDENCIES = {
+    "project": ["project"],
+    "resource": ["resource"],
+    "publication": ["project", "publication"],
+    "course": ["project", "resource", "publication", "course"],
+}
+
+
+def _component_result(drv, domain, operation, args, res, content_root=None,
+                      include_selector=True):
+    """Run a read-only component adapter operation and merge its JSON result."""
+    command = ["hub-component", domain, operation, "--manifest",
+               "/etc/hubzero/hub.yml", "--max-items", str(args.max_items)]
+    if content_root:
+        command = ["env", "HUB_CONTENT_ROOT=" + content_root] + command
+    elif drv.name == "kubernetes" and operation in ("plan", "verify"):
+        command = ["env", "HUB_CONTENT_DEFERRED=1"] + command
+    if include_selector and operation in ("inspect", "verify", "export") and args.alias:
+        command += ["--alias", args.alias]
+    if include_selector and operation in ("inspect", "verify", "export") and args.id:
+        command += ["--id", str(args.id)]
+    run = drv.exec("web", command)
+    raw = (run.stdout or "").strip()
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        res.fail("%s adapter returned invalid JSON" % domain)
+        if run.stderr:
+            res.say(scrub(run.stderr).strip())
+        return None
+
+    res.data = payload.get("data")
+    for detail in payload.get("details", []):
+        res.say(str(detail))
+    for check in payload.get("checks", []):
+        res.check(check.get("name", "component check"),
+                  check.get("ok", False), check.get("info", ""))
+    for error in payload.get("errors", []):
+        res.fail(str(error))
+    if run.returncode != 0 and not payload.get("errors"):
+        res.fail("%s %s failed" % (domain, operation))
+    return payload
+
+
+def _component_plan(drv, domain, args, res, content_root=None):
+    """Plan the selected domain and every earlier declared dependency."""
+    plans = {}
+    authorization = set()
+    files = []
+    routes = []
+    errors = []
+    for dependency in COMPONENT_DEPENDENCIES[domain]:
+        payload = _component_result(
+            drv, dependency, "plan", args, res, content_root=content_root,
+            include_selector=False)
+        if not payload:
+            continue
+        plans[dependency] = payload.get("data", {})
+        authorization.update(payload.get("authorization", []))
+        files.extend(payload.get("files", []))
+        routes.extend(payload.get("routes", []))
+        errors.extend(payload.get("errors", []))
+    aggregate = {
+        "plans": plans,
+        "authorization": sorted(authorization),
+        "files": files,
+        "routes": list(dict.fromkeys(routes)),
+        "errors": errors,
+    }
+    res.data = aggregate
+    return aggregate
+
+
+def _verify_component_routes(drv, routes, res):
+    """Prove component routes render their native component, not a catch-all."""
+    base = drv.url().rstrip("/")
+    for route in routes or []:
+        status, body, _headers = http_get(base + route)
+        text_body = body.decode("utf-8", "replace")
+        marker = ('com_' in text_body or 'component-' in text_body
+                  or route.strip("/").split("/")[0].lower() in text_body.lower())
+        res.check("route " + route, status == 200 and marker,
+                  "HTTP %s; native marker %s" % (status, "found" if marker else "missing"))
+
+
+def _stage_kubernetes_component_files(drv, env, files, res):
+    """Stage approved imports for one Kubernetes apply without changing its API."""
+    if drv.name != "kubernetes" or not files:
+        return None
+    configured = env.get("HUB_CONTENT_PATH", "./content")
+    root = os.path.realpath(
+        configured if os.path.isabs(configured)
+        else os.path.join(drv.dir, configured))
+    if not os.path.isdir(root):
+        res.fail("component content root does not exist: " + root)
+        return False
+
+    sources = {}
+    for entry in files:
+        requested = str(entry.get("path", "")).replace("\\", "/")
+        relative = requested[8:] if requested.startswith("content/") else requested
+        source = os.path.realpath(os.path.join(root, relative))
+        try:
+            inside = os.path.commonpath([root, source]) == root
+        except ValueError:
+            inside = False
+        if (not relative or os.path.isabs(relative) or ".." in relative.split("/")
+                or not inside or not os.path.isfile(source)):
+            res.fail("unsafe or missing component content path: " + requested)
+            return False
+        sources[relative] = source
+
+    handle = tempfile.NamedTemporaryFile(
+        prefix="autohub-content-", suffix=".tar.gz", delete=False)
+    archive = handle.name
+    handle.close()
+    try:
+        with tarfile.open(archive, "w:gz") as bundle:
+            for relative, source in sorted(sources.items()):
+                bundle.add(source, arcname=relative, recursive=False)
+        suffix = hashlib.sha256(
+            (drv.target_id() + "\n" + "\n".join(sorted(sources))).encode()
+        ).hexdigest()[:16]
+        destination = "/tmp/autohub-content-" + suffix
+        run = drv.stream_from_file("web", ["bash", "-c",
+            "mkdir -p " + destination + " && tar -xzf - -C " + destination],
+            archive)
+        if run.returncode != 0:
+            res.fail("failed to stage component content in the Kubernetes pod")
+            return False
+        res.check("component content staging", True,
+                  "%d approved file(s)" % len(sources))
+        return destination
+    finally:
+        os.unlink(archive)
+
+
+def cmd_component(drv, env, args, res):
+    domain = args.cmd
+    operation = args.sub
+    requested_manifest = os.path.realpath(os.path.join(drv.dir, args.manifest))
+    mounted_manifest = os.path.realpath(os.path.join(drv.dir, "hub.yml"))
+    if requested_manifest != mounted_manifest:
+        res.fail("component commands currently accept the project hub.yml only")
+        return res
+
+    if operation == "plan":
+        _component_plan(drv, domain, args, res)
+        return res
+
+    if operation != "apply":
+        payload = _component_result(drv, domain, operation, args, res)
+        if payload and operation == "verify":
+            _verify_component_routes(drv, payload.get("routes", []), res)
+        return res
+
+    plan = _component_plan(drv, domain, args, res)
+    if not plan or not res.ok or res.verify_failed:
+        res.fail("apply refused because the component plan did not pass")
+        return res
+
+    required = set(plan.get("authorization", []))
+    allowed = set(args.authorize or [])
+    missing = sorted(required - allowed)
+    if missing:
+        res.fail("apply requires explicit --authorize for: " + ", ".join(missing))
+        return res
+
+    section_name = COMPONENT_SECTIONS[domain]
+    staged_root = _stage_kubernetes_component_files(
+        drv, env, plan.get("files", []), res)
+    if staged_root is False:
+        return res
+    if staged_root:
+        validated = _component_plan(
+            drv, domain, args, res, content_root=staged_root)
+        if not validated or not res.ok or res.verify_failed:
+            res.fail("apply refused because staged component files did not validate")
+            return res
+        plan = validated
+    command = ["env", "HUB_COMPONENT_APPLY=" + section_name,
+               "HUB_COMPONENT_AUTHORIZATION=" + ",".join(sorted(allowed))]
+    if staged_root:
+        command.append("HUB_CONTENT_ROOT=" + staged_root)
+    command.append("hub-provision")
+    run = drv.exec("web", command, timeout=900)
+    for line in scrub((run.stdout or "") + (run.stderr or "")).splitlines():
+        if line.strip():
+            res.say(line)
+    if run.returncode != 0:
+        res.fail("%s apply failed" % domain)
+        return res
+
+    verify_routes = []
+    verify_data = {}
+    for dependency in COMPONENT_DEPENDENCIES[domain]:
+        verify = _component_result(
+            drv, dependency, "verify", args, res, content_root=staged_root,
+            include_selector=(dependency == domain))
+        if verify:
+            verify_routes.extend(verify.get("routes", []))
+            verify_data[dependency] = verify.get("data", {})
+    res.data = {"verification": verify_data}
+    _verify_component_routes(drv, list(dict.fromkeys(verify_routes)), res)
+    res.suggest("cli/autohub verify --scope components --json")
+    return res
+
+
 # ---------------------------------------------------------------------------
 # argument parsing
 # ---------------------------------------------------------------------------
@@ -1840,6 +2060,22 @@ def build_parser():
     s = add("muse", help="pass a command to muse")
     s.add_argument("args", nargs=argparse.REMAINDER)
     s.set_defaults(fn=cmd_muse)
+
+    for domain in ("project", "resource", "publication", "course"):
+        s = add(domain, help="native %s component records" % domain)
+        s.add_argument("sub", choices=[
+            "describe", "inspect", "plan", "apply", "verify", "export"])
+        s.add_argument("--manifest", default="hub.yml",
+                       help="manifest path (currently the project hub.yml)")
+        s.add_argument("--alias", help="inspect or verify one stable alias")
+        s.add_argument("--id", type=int, help="inspect or verify one exact native id")
+        s.add_argument("--max-items", type=int, default=25,
+                       help="maximum records accepted from the manifest")
+        s.add_argument("--authorize", action="append", default=[],
+                       choices=["publish", "access-change", "membership-change",
+                                "archive"],
+                       help="authorize a planned sensitive transition; repeat as needed")
+        s.set_defaults(fn=cmd_component)
 
     return p
 

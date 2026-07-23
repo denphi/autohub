@@ -135,10 +135,11 @@ articles:
       <p>Describe the hub's mission, community, and governance here.</p>
 
 # Datasets, tools, publications, and other catalogued research objects belong
-# in com_resources. Matched on title, so editing one updates rather than
-# duplicates it. `type` is a resource_type alias from above.
+# in com_resources. New manifests should use a stable alias; title matching is
+# retained only for backward compatibility. `type` is a resource_type alias.
 resources:
-  - title: Example Simulation Tool
+  - alias: example-simulation-tool
+    title: Example Simulation Tool
     type: tools
     published: 1
     introtext: A placeholder tool resource created by hub-provision.
@@ -162,6 +163,52 @@ users:
     name: Test User
     email: tester@example.com
     password: ${TEST_USER_PASSWORD}
+
+# --- High-value native components ------------------------------------------
+# Use `cli/autohub <domain> describe --json` before authoring these sections,
+# then `plan`, `apply`, and `verify`. Sensitive transitions require the exact
+# --authorize values reported by plan. Project aliases are alphanumeric in the
+# pinned HUBzero revision even though the other component aliases allow '-'.
+#
+# projects:
+#   - alias: pollinatorlab
+#     title: Pollinator Lab
+#     description: Shared research workspace.
+#     status: active
+#     team:
+#       - { username: tester, role: manager }
+#
+# publications:
+#   - alias: flower-pollination-gallery
+#     title: Flower Pollination Gallery
+#     project: pollinatorlab
+#     category: dataset
+#     abstract: Flower images with pollination observations.
+#     authors: [tester]
+#     state: draft
+#     attachments:
+#       - path: content/flowers/milkweed.jpg
+#         title: Milkweed flower
+#         description: A pollinator visiting milkweed blossoms.
+#         alt: Pollinator on pink milkweed flowers.
+#         media_type: image/jpeg
+#         credit: Research team
+#
+# courses:
+#   - alias: pollination-basics
+#     title: Pollination Basics
+#     description: A short native HUBzero course.
+#     state: draft
+#     units:
+#       - alias: flower-structures
+#         title: Flower Structures
+#         assets:
+#           - type: content
+#             title: Reading
+#             content: "<p>Introduction to flower structures.</p>"
+#           - type: resource
+#             title: Explore the example tool
+#             resource: example-simulation-tool
 
 # --- Modules ----------------------------------------------------------------
 # Position matters more than it looks: a module in a position the active

@@ -80,10 +80,12 @@ You only rebuild the image when PHP itself changes, which is roughly never.
 | [scripts/hub-init.sh](../assets/scaffold/scripts/hub-init.sh) | Scaffolds `.env` + `hub.yml` for a new hub |
 | [template-starter/](../assets/scaffold/template-starter/) | Native-component-first baseline used by `autohub template create` |
 | [hub.yml.example](../assets/scaffold/hub.yml.example) | Declarative hub setup — copy to `hub.yml` |
+| [component-tools/](../assets/scaffold/component-tools/) | Native component registry and manifest schemas |
+| [content/](../assets/scaffold/content/) | Read-only import root for approved resource/publication files |
 | [docker-compose.yml](../assets/scaffold/docker-compose.yml) | Production stack: web, cron, db |
 | [docker-compose.dev.yml](../assets/scaffold/docker-compose.dev.yml) | Dev overlay: local checkout, Adminer, Mailpit |
 
-Four storage mounts, with deliberately different lifetimes:
+Five storage mounts, with deliberately different lifetimes:
 
 - `hub_src` → `/var/www/html` — the CMS checkout. Disposable; recreated from git.
 - `hub_app` → `/var/www/html/app` — **your data**: config, uploads, logs, sessions.
@@ -91,7 +93,15 @@ Four storage mounts, with deliberately different lifetimes:
 - `${HUB_TLS_PATH:-hub_tls}` → `/etc/hubzero/tls` — a named volume for the
   self-signed fallback, `.autohub/tls` after local trusted setup, or an
   operator-managed production certificate directory.
+- `${HUB_CONTENT_PATH:-./content}` → `/etc/hubzero/content` — read-only
+  operator-approved imports; adapters validate and copy files into `hub_app`.
 - `db_data` → MariaDB.
+
+On Kubernetes, the same component `apply` command packages only the file paths
+reported by the reviewed plan, streams them to a per-target temporary pod
+directory, and points the provisioner at that directory for the duration of
+the apply. Files still undergo the same in-runtime validation before entering
+component-owned persistent storage.
 
 ## Development
 
@@ -124,6 +134,7 @@ run directly with `docker compose exec web <script>`:
 | `hub-muse <args>` | HUBzero's own CLI, as the web user |
 | `hub-backup [-]` | dump the database |
 | `hub-provision [file]` | apply hub.yml -- extensions, template, plugins, content |
+| `hub-component <domain> <verb>` | native component discovery, planning, inspection, verification, and export |
 | `hub-assets [--clean]` | compile the active template's LESS, reporting syntax errors |
 | `hub-update [ref]` | source + deps + config + migrations, in one step |
 
@@ -138,6 +149,8 @@ cli/autohub template create --name researchhub --json
 cli/autohub assets lint --json
 cli/autohub verify --scope tls --json
 cli/autohub verify --scope components --route /about --json
+cli/autohub publication describe --json
+cli/autohub publication plan --max-items 3 --json
 ```
 
 The TLS command validates hostnames, installs mkcert's local CA, issues an
@@ -207,7 +220,10 @@ components:
 resource_types:                   # ids pinned so content stays portable
   - { id: 7, alias: tools, type: Tools, category: 27, state: 1 }
 
-resources: [...]                  # example content
+projects:  [...]                  # native team workspaces
+resources: [...]                  # datasets, tools, and downloads
+publications: [...]               # native versioned research outputs
+courses:   [...]                  # course/unit/asset hierarchies
 users:     [...]                  # extra accounts (admin comes from .env)
 groups:    [...]
 menus:     { site: [...] }        # including which item is the front page
@@ -248,8 +264,9 @@ menus:
 ```
 
 The `article:` menu shorthand resolves a published article by alias and creates
-the normal `com_content` link. Datasets, tools, and publications remain
-`resources:`; communities remain `groups:`.
+the normal `com_content` link. Datasets, tools, and downloads use `resources:`;
+versioned research outputs use `publications:`; learning hierarchies use
+`courses:`; team workspaces use `projects:`; and communities use `groups:`.
 
 A template owns shared presentation, assets, module positions, and optional
 component markup overrides. It must render the component buffer. Do not put

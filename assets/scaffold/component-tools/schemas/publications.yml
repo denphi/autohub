@@ -1,0 +1,15 @@
+section: publications
+required: [alias, title, project, authors]
+fields:
+  alias: { type: string, pattern: "^[a-z0-9][a-z0-9-]*$" }
+  title: { type: string }
+  project: { type: project_alias }
+  abstract: { type: string }
+  description: { type: string }
+  category: { type: installed_publication_category }
+  license: { type: installed_publication_license }
+  authors: { type: user_reference_list }
+  state: { enum: [draft, pending, published], publish_authorization: publish }
+  access: { type: integer, authorization: access-change }
+  attachments: { type: content_import_list }
+deletion: unsupported

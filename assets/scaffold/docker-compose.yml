@@ -35,6 +35,7 @@ x-hub-env: &hub-env
   HUB_LIVE_SITE: ${HUB_LIVE_SITE:-}
   HUB_SECRET: ${HUB_SECRET:-}
   HUB_TLS_CN: ${HUB_TLS_CN:-localhost}
+  HUB_CONTENT_ROOT: /etc/hubzero/content
 
   # Initial administrator (only used while the database is empty)
   HUB_ADMIN_USER: ${HUB_ADMIN_USER:-admin}
@@ -86,6 +87,9 @@ services:
       # `chown -R` fail and crashloop the container. `make up` creates an empty
       # hub.yml if absent -- the file must exist or Docker mounts a directory.
       - ./hub.yml:/etc/hubzero/hub.yml:ro
+      # User-approved import root for Resources/Publications attachments.
+      # It is read-only; adapters copy validated files into component storage.
+      - ${HUB_CONTENT_PATH:-./content}:/etc/hubzero/content:ro
       # First-class project-local template development. `autohub template
       # create --name <alias>` updates these two .env values to mount the
       # generated template without masking remotely installed app templates.

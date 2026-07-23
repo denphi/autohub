@@ -1,0 +1,14 @@
+section: resources
+required: [title, type]
+fields:
+  alias: { type: string, pattern: "^[a-z0-9][a-z0-9-]*$", recommended: true, legacy_fallback: title }
+  title: { type: string }
+  type: { type: resource_type_alias }
+  introtext: { type: string }
+  fulltxt: { type: string }
+  published: { type: integer }
+  access: { type: integer }
+  contributors: { type: list }
+  tags: { type: list }
+  files: { type: content_import_list }
+deletion: unsupported

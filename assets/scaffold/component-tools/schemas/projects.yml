@@ -1,0 +1,17 @@
+section: projects
+required: [alias, title, team]
+fields:
+  alias: { type: string, pattern: "^[a-z][a-z0-9]{2,29}$" }
+  title: { type: string }
+  description: { type: string }
+  status: { enum: [active, pending, archived] }
+  access: { enum: [public, private, open], authorization: access-change }
+  team:
+    type: list
+    authorization: membership-change
+    item:
+      required: [username]
+      fields:
+        username: { type: string }
+        role: { enum: [manager, collaborator] }
+deletion: unsupported

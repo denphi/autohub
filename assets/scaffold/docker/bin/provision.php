@@ -60,6 +60,27 @@ if (!is_array($manifest))
 	exit(0);
 }
 
+// Component commands apply only their own manifest domain and declared
+// dependencies. Generic `hub-provision` keeps its existing all-sections
+// behavior. This is a positive allow-list: unknown values fail closed.
+$componentApply = getenv('HUB_COMPONENT_APPLY') ?: '';
+if ($componentApply)
+{
+	$componentSections = array(
+		'projects' => array('users', 'groups', 'projects'),
+		'resources' => array('users', 'resource_types', 'resources'),
+		'publications' => array('users', 'groups', 'projects', 'publications'),
+		'courses' => array('users', 'groups', 'projects', 'resource_types',
+			'resources', 'publications', 'courses'),
+	);
+	if (!isset($componentSections[$componentApply]))
+	{
+		fwrite(STDERR, "[hub] ERROR: unknown HUB_COMPONENT_APPLY value\n");
+		exit(1);
+	}
+	$manifest = array_intersect_key($manifest, array_flip($componentSections[$componentApply]));
+}
+
 $migration = new Migration($db);
 $changed   = 0;
 $failed    = 0;
@@ -737,18 +758,42 @@ if (!empty($manifest['resources']))
 					. (isset($resource['type']) ? $resource['type'] : '?') . "'");
 			}
 
-			$db->setQuery("SELECT `id` FROM `#__resources` WHERE `title` = " . $db->quote($title));
-			$existing = $db->loadResult();
+			$alias = isset($resource['alias']) ? trim((string) $resource['alias']) : '';
+			if ($alias && !preg_match('/^[a-z0-9][a-z0-9-]*$/', $alias))
+			{
+				throw new Exception("alias must be lowercase letters, numbers, and hyphens");
+			}
 
-			$fields = array(
-				'title'     => $title,
-				'type'      => $typeId,
-				'published' => isset($resource['published']) ? (int) $resource['published'] : 1,
-				'introtext' => isset($resource['introtext']) ? $resource['introtext'] : '',
-				'fulltxt'   => isset($resource['fulltxt']) ? $resource['fulltxt'] : '',
-				'standalone' => 1,
-				'access'    => 0,
-			);
+			$db->setQuery("SELECT `id`, `title` FROM `#__resources` WHERE `alias` = "
+				. $db->quote($alias));
+			$aliasRow = $alias ? $db->loadObject() : null;
+			$db->setQuery("SELECT `id`, `alias` FROM `#__resources` WHERE `title` = "
+				. $db->quote($title));
+			$titleRow = $db->loadObject();
+
+			if ($aliasRow && $titleRow && (int) $aliasRow->id !== (int) $titleRow->id)
+			{
+				throw new Exception("alias/title collision identifies two resources");
+			}
+			$existing = $aliasRow ? (int) $aliasRow->id : ($titleRow ? (int) $titleRow->id : 0);
+
+			$fields = array('title' => $title, 'type' => $typeId);
+			foreach (array('published', 'introtext', 'fulltxt', 'access') as $field)
+			{
+				if (array_key_exists($field, $resource))
+				{
+					$fields[$field] = $resource[$field];
+				}
+			}
+			if ($alias)
+			{
+				$fields['alias'] = $alias;
+			}
+			if (!$existing)
+			{
+				$fields += array('published' => 1, 'introtext' => '', 'fulltxt' => '',
+					'standalone' => 1, 'access' => 0);
+			}
 
 			$set = array();
 
@@ -1060,6 +1105,11 @@ if (!empty($manifest['groups']))
 		});
 	}
 }
+
+// Component-native relationships and the three new high-value domains run
+// after users/groups so declared usernames resolve on a first provision.
+require_once __DIR__ . '/components/provision.php';
+autohub_provision_component_content($manifest, $db);
 
 // ---------------------------------------------------------------------------
 // Menus
