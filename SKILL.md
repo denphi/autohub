@@ -47,7 +47,9 @@ hub identity and configuration:
 
 ```bash
 cli/autohub init --site "Research Hub" --json
+cli/autohub tls setup --json
 cli/autohub up --wait --json
+cli/autohub verify --scope tls --json
 cli/autohub verify --json
 ```
 
@@ -56,6 +58,15 @@ wildcard IPv4 and IPv6 interfaces. Do not replace its generated namespace with
 a shared name. First boot can take several minutes while the CMS is cloned,
 dependencies are installed, and the schema is loaded and repaired. Use
 `up --wait`; do not replace it with ad-hoc log polling.
+
+For local Docker projects, `tls setup` uses mkcert to create and install a
+local certificate authority in the host trust stores, then issues a leaf
+certificate into the ignored `.autohub/tls/` directory. Installing a local CA
+changes host trust and can prompt for administrator credentials, so obtain
+explicit user/tool authorization before running it. Never copy, expose, or
+commit mkcert's `rootCA-key.pem`. If mkcert is unavailable, install it using
+the platform's supported package manager with authorization; do not accept a
+browser warning as a completed HTTPS setup.
 
 `init` stores generated credentials in `.env` with mode 600. Report that the
 credentials were created and where they are stored, but never reproduce a
@@ -88,7 +99,7 @@ Use the narrowest useful sequence:
 ```bash
 cli/autohub doctor --json
 cli/autohub logs --errors --json
-cli/autohub verify --scope <site|assets|components|mail|login|db> --json
+cli/autohub verify --scope <site|tls|assets|components|mail|login|db> --json
 cli/autohub db query "SELECT ... FROM jos_extensions" --json
 ```
 
@@ -106,6 +117,7 @@ Map common evidence to the smallest relevant action:
 | Missing table or column | error log and DB scope | run `migrate`, then full verification |
 | Required seed is missing | doctor identifies a known seed | run `provision`, then full verification |
 | Changed CSS appears stale | no server error; old browser bytes | clear and warm caches, then hard-reload |
+| Browser reports an untrusted certificate | TLS scope or `tls status` fails | run authorized `tls setup`, recreate the web service, then verify TLS |
 
 ## Apply configuration changes
 
@@ -206,10 +218,13 @@ desktop and narrow/mobile states; check authenticated states where applicable.
 Test empty states for every reachable public component and populated list/detail
 states for components the hub uses. Check headings, main/aside layouts, filters,
 forms, actions, tables, tabs, pagination, messages, focus, overflow, and errors.
-For local visual QA, use the equivalent HTTP frontend if automation rejects the
-self-signed certificate; retain HTTPS for administrator login verification. If
-no browser capability is available, report visual verification as incomplete
-instead of claiming success.
+Perform local visual and administrator QA over HTTPS after
+`verify --scope tls` passes. A certificate warning or browser-automation trust
+failure is an incomplete deployment prerequisite: run authorized `tls setup`,
+recreate the web service, and retry. If host-trust authorization is denied,
+report HTTPS/browser verification as incomplete; do not silently switch to HTTP
+and claim completion. If no browser capability is available, report visual
+verification as incomplete instead of claiming success.
 
 Legacy LesserPHP cannot evaluate mixed-unit CSS `min()`/`max()` expressions.
 Run the host-side lint before startup and replace them with compatible width,
@@ -285,8 +300,10 @@ confirmation flag does not replace explicit authorization or a durable backup.
 
 - Keep `.env` for secrets and infrastructure, `hub.yml` for supported hub
   configuration, and `autohub.yml` for the deployment target.
-- Use HTTPS for administrator login. Local Docker can use a self-signed
-  certificate; production must use a trusted certificate.
+- Use HTTPS for browser and administrator verification. Local Docker should
+  use `autohub tls setup` and a host-trusted mkcert leaf certificate;
+  production must use a publicly trusted certificate or trusted ingress, never
+  the mkcert development CA.
 - Stay behind `cli/autohub`. If a required operation is missing, improve the
   CLI instead of embedding raw Docker- or Kubernetes-specific commands here.
 - Never reproduce `.env`, passwords, tokens, sessions, private keys, or

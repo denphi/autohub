@@ -6,6 +6,8 @@ __pycache__/
 # deployment manifest local because it may contain organization-specific state.
 .env
 /hub.yml
+/.autohub/
+rootCA-key.pem
 
 # Local CMS checkout used by the development overlay.
 /hubzero-cms

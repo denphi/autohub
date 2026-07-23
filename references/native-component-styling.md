@@ -140,7 +140,10 @@ Use browser inspection to confirm:
 - correct active navigation and component ownership;
 - populated component list/detail states when the hub uses that component.
 
-For local visual inspection, use the HTTP frontend when browser automation
-cannot accept the generated self-signed certificate. Continue to use HTTPS for
-administrator authentication. If browser inspection cannot be completed,
-report visual verification as incomplete.
+For local visual inspection and administrator authentication, use HTTPS only
+after `cli/autohub verify --scope tls --json` passes. If the browser rejects
+the certificate, run the authorized `cli/autohub tls setup --json` workflow,
+recreate the web service, and retry. Do not use HTTP to hide a trust failure and
+then report browser verification as complete. If host-trust authorization or
+browser inspection is unavailable, report the corresponding verification as
+incomplete.

@@ -24,7 +24,9 @@ root.
 
 ```bash
 ./scripts/hub-init.sh --site "My Hub"    # generates .env + hub.yml, all secrets random
+cli/autohub tls setup --json             # installs a local CA and issues a trusted leaf
 make up
+cli/autohub verify --scope tls --json
 ```
 
 `hub-init.sh` probes wildcard IPv4 and IPv6 bindings for free ports, generates
@@ -33,14 +35,21 @@ every secret, assigns a project-specific Compose namespace, writes `.env` mode
 the options; `make init ARGS="--site ..."` is the same thing. Generated
 passwords remain in `.env` and are deliberately not printed.
 
+`tls setup` requires [mkcert](https://github.com/FiloSottile/mkcert). It
+installs mkcert's local CA into host trust stores, which may request
+administrator credentials, and writes only the project leaf certificate and
+key under the ignored `.autohub/tls/` directory. Get explicit authorization
+before changing host trust. Never copy or commit mkcert's `rootCA-key.pem`.
+
 First boot takes a few minutes (clone, `composer install`, schema load, schema
 repair). Watch it with `make logs`. When it settles:
 
 - site — <http://localhost:8080> or <https://localhost:8443>
 - admin — <https://localhost:8443/administrator> (**https only**, see below)
 
-The certificate is self-signed on first boot, so expect a browser warning until
-you supply a real one.
+HTTPS should open without a certificate warning after `tls setup`. If setup is
+skipped, the container generates a self-signed fallback so HUBzero can start,
+but browser-trusted HTTPS verification remains incomplete.
 
 ## The one idea worth knowing
 
@@ -74,12 +83,14 @@ You only rebuild the image when PHP itself changes, which is roughly never.
 | [docker-compose.yml](../assets/scaffold/docker-compose.yml) | Production stack: web, cron, db |
 | [docker-compose.dev.yml](../assets/scaffold/docker-compose.dev.yml) | Dev overlay: local checkout, Adminer, Mailpit |
 
-Three volumes, with deliberately different lifetimes:
+Four storage mounts, with deliberately different lifetimes:
 
 - `hub_src` → `/var/www/html` — the CMS checkout. Disposable; recreated from git.
 - `hub_app` → `/var/www/html/app` — **your data**: config, uploads, logs, sessions.
   Nested inside `hub_src` so resetting the source can never take it with it.
-- `hub_tls` → `/etc/hubzero/tls` — certificate and key. Mount real ones here.
+- `${HUB_TLS_PATH:-hub_tls}` → `/etc/hubzero/tls` — a named volume for the
+  self-signed fallback, `.autohub/tls` after local trusted setup, or an
+  operator-managed production certificate directory.
 - `db_data` → MariaDB.
 
 ## Development
@@ -107,7 +118,7 @@ run directly with `docker compose exec web <script>`:
 | `hub-composer [--force]` | install `core/vendor` (skipped when `composer.lock` is unchanged) |
 | `hub-config-render` | regenerate `app/config/*.php` from the environment |
 | `hub-db-init [--force]` | load `schema.sql` + `data.sql`, baseline, then repair |
-| `hub-tls` | generate a self-signed certificate if none is present |
+| `hub-tls` | preserve a mounted certificate or generate a self-signed fallback |
 | `hub-migrate [--dry-run\|--baseline]` | run pending migrations |
 | `hub-admin <user> <pass>` | low-level admin reset; prefer `cli/autohub admin <user>`, which reads the password from `.env` rather than argv |
 | `hub-muse <args>` | HUBzero's own CLI, as the web user |
@@ -121,10 +132,18 @@ Everything is idempotent — a restart re-runs the lot and changes nothing.
 The host CLI also owns local template creation and verification:
 
 ```bash
+cli/autohub tls setup --json
+cli/autohub tls status --json
 cli/autohub template create --name researchhub --json
 cli/autohub assets lint --json
+cli/autohub verify --scope tls --json
 cli/autohub verify --scope components --route /about --json
 ```
+
+The TLS command validates hostnames, installs mkcert's local CA, issues an
+ignored project certificate, configures its Docker bind mount, and verifies
+that the host accepts the running HTTPS endpoint without `-k` or an insecure
+SSL context.
 
 The template command creates and mounts `templates/researchhub`, updates
 `hub.yml`, and avoids one-off Compose edits. Component verification inventories
@@ -328,10 +347,13 @@ so a source update never leaves the schema behind.
 
 **TLS is mandatory.** `com_login`'s controller hardcodes a redirect to `https://`
 with no setting to disable it, so the admin panel is unreachable over plain HTTP.
-The stack therefore serves `:443` with a self-signed certificate generated on
-first boot — replace it by mounting real `hub.crt`/`hub.key` into the `hub_tls`
-volume. Behind a proxy, the vhost honours `X-Forwarded-Proto`, which `com_login`
-needs since it reads `$_SERVER['HTTPS']` directly.
+The stack therefore serves `:443`. For local Docker, run
+`cli/autohub tls setup --json` to mount a host-trusted mkcert pair; the
+container generates a self-signed pair only as a startup fallback. You can
+instead set `HUB_TLS_PATH` to a directory containing operator-managed
+`hub.crt` and `hub.key`. Behind a proxy, the vhost honours
+`X-Forwarded-Proto`, which `com_login` needs since it reads
+`$_SERVER['HTTPS']` directly.
 
 **`/usr/bin/php` is symlinked into place.** `core/bin/muse` hardcodes
 `#!/usr/bin/php`, but the official PHP images install the binary at
@@ -366,8 +388,10 @@ handler logs the warning to `app/logs` *before* deciding whether to die.
 
 ## Production notes
 
-- **TLS**: either mount real certificates into `hub_tls`, or terminate upstream
-  and let the vhost's `X-Forwarded-Proto` handling take over. Set
+- **TLS**: mkcert is development-only. For production, set `HUB_TLS_PATH` to an
+  operator-managed directory containing a publicly trusted `hub.crt` and
+  `hub.key`, or terminate TLS upstream and let the vhost's
+  `X-Forwarded-Proto` handling take over. Set
   `HUB_FORCE_SSL=1` and `HUB_LIVE_SITE=https://your.hub`, and uncomment the HSTS
   header in [hubzero.conf](../assets/scaffold/docker/apache/hubzero.conf) once the hostname has a
   real certificate.
@@ -392,4 +416,5 @@ handler logs the warning to `app/logs` *before* deciding whether to die.
 ## Requirements
 
 Docker Engine 20.10+ with Compose v2. Builds and runs on both `amd64` and
-`arm64`.
+`arm64`. Browser-trusted local HTTPS requires mkcert; Firefox may also require
+the NSS tools described by mkcert for the host platform.

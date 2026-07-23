@@ -291,4 +291,5 @@ if [ -n "$TEMPLATE_URL" ]; then
 	note "set GITLAB_TOKEN in .env if that template repository is private"
 fi
 
-note "next: make up   (first boot takes a few minutes)"
+note "next: cli/autohub tls setup --json   (trusted local HTTPS)"
+note "then: cli/autohub up --wait --json   (first boot takes a few minutes)"

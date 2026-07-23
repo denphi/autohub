@@ -176,8 +176,10 @@ this list was found by hitting the failure live:
   DB, mailpit Deployment (or SMTP relay Secret).
 - **R13 — HTTPS is not optional.** `com_login` hardcodes an https redirect;
   Apache header limits needed raising for HUBzero's cookie load
-  (`LimitRequestFieldSize 32768`). Docker: self-signed via `hub-tls.sh`;
-  k8s: Ingress + cert-manager, same header limits on the ingress/pod.
+  (`LimitRequestFieldSize 32768`). Docker uses a host-trusted mkcert leaf
+  through `autohub tls setup`, with `hub-tls.sh` retaining self-signed
+  generation only as a startup fallback. Kubernetes uses Ingress plus
+  cert-manager, with the same header limits on the ingress/pod.
 
 ---
 
@@ -216,8 +218,9 @@ autohub up        [--wait --timeout]                 → compose up -d --build; 
 autohub down                                         → compose down (keeps volumes)
 autohub destroy   --force --confirm <target> --snapshot <dir> → delete volumes only after target + recovery validation
 autohub status                                       → per-service state/health + url (R11)
+autohub tls       setup|status [--hostname NAME]     → trusted local Docker certificate + host trust verification
 autohub provision                                    → hub-provision; parses "N applied, M failed" (R1–R4)
-autohub verify    [--scope all|site|assets|components|mail|login|db] [--route PATH]   (R9)
+autohub verify    [--scope all|site|tls|assets|components|mail|login|db] [--route PATH]   (R9)
 autohub assets    build|clean|lint                   → host LESS preflight + hub-assets (R5)
 autohub cache     clear [--warm]                     → hub-muse cache clear (+ warm request) (R6)
 autohub doctor    [--tail]                           → recent web logs → known-cause table (R10)

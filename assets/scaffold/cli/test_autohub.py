@@ -31,6 +31,7 @@ class FakeDriver:
     def __init__(self, project_dir):
         self.dir = project_dir
         self.restored = []
+        self.restore_commands = {}
         self.destroyed = False
 
     def target_id(self):
@@ -48,6 +49,7 @@ class FakeDriver:
 
     def stream_from_file(self, service, command, path):
         self.restored.append((service, os.path.basename(path)))
+        self.restore_commands[os.path.basename(path)] = command
         return subprocess.CompletedProcess(command, 0, "", "")
 
     def restart(self, service):
@@ -108,6 +110,10 @@ class SnapshotTests(unittest.TestCase):
             ("web", "hub_tls.tar.gz"),
             ("db", "database.sql.gz"),
         ])
+        tls_command = " ".join(
+            self.driver.restore_commands["hub_tls.tar.gz"])
+        self.assertIn("find /etc/hubzero/tls -mindepth 1", tls_command)
+        self.assertNotIn("rm -rf /etc/hubzero/tls;", tls_command)
 
 
 class SafetyTests(unittest.TestCase):
@@ -294,6 +300,10 @@ class VerificationTests(unittest.TestCase):
         template = parser.parse_args(
             ["template", "create", "--name", "researchhub"])
         self.assertEqual(template.sub, "create")
+        tls = parser.parse_args(
+            ["tls", "setup", "--hostname", "research.localhost"])
+        self.assertEqual(tls.sub, "setup")
+        self.assertEqual(tls.hostname, ["research.localhost"])
 
     def test_component_scope_inventories_defaults_menu_and_extra_routes(self):
         class RouteDriver(FakeDriver):
@@ -328,6 +338,97 @@ class VerificationTests(unittest.TestCase):
             self.assertIn("component route /about", names)
             self.assertIn("component route /learn", names)
             self.assertFalse(result.verify_failed)
+
+
+class TrustedTlsTests(unittest.TestCase):
+    def test_hostname_validation_adds_localhost_ips_and_rejects_flags(self):
+        names = autohub._validated_tls_hostnames(
+            ["research.localhost"], {"HUB_TLS_CN": "ignored"})
+        self.assertEqual(names[0], "research.localhost")
+        self.assertIn("localhost", names)
+        self.assertIn("127.0.0.1", names)
+        self.assertIn("::1", names)
+        with self.assertRaises(Exception):
+            autohub._validated_tls_hostnames(["--unsafe"], {})
+
+    def test_tls_setup_issues_ignored_project_certificate_and_updates_env(self):
+        with tempfile.TemporaryDirectory() as project:
+            with open(os.path.join(project, ".env"), "w", encoding="utf-8") as f:
+                f.write("HUB_TLS_PATH=hub_tls\nHUB_TLS_CN=localhost\n")
+            driver = FakeDriver(project)
+            args = type("Args", (), {
+                "sub": "setup",
+                "hostname": ["research.localhost"],
+            })()
+
+            def fake_run(command, **_kwargs):
+                if "-cert-file" in command:
+                    cert = command[command.index("-cert-file") + 1]
+                    key = command[command.index("-key-file") + 1]
+                    with open(cert, "w", encoding="utf-8") as stream:
+                        stream.write("certificate")
+                    with open(key, "w", encoding="utf-8") as stream:
+                        stream.write("private-key")
+                return subprocess.CompletedProcess(command, 0, "ok", "")
+
+            result = autohub.Result("tls")
+            with mock.patch.object(autohub.shutil, "which",
+                                   return_value="/usr/local/bin/mkcert"), \
+                    mock.patch.object(autohub.subprocess, "run",
+                                      side_effect=fake_run):
+                autohub.cmd_tls(driver, autohub.read_env(project), args, result)
+
+            self.assertFalse(result.verify_failed)
+            env = autohub.read_env(project)
+            self.assertEqual(env["HUB_TLS_PATH"], "./.autohub/tls")
+            self.assertEqual(env["HUB_TLS_MODE"], "mkcert")
+            self.assertEqual(env["HUB_TLS_CN"], "research.localhost")
+            key = os.path.join(project, ".autohub", "tls", "hub.key")
+            self.assertEqual(stat.S_IMODE(os.stat(key).st_mode), 0o600)
+
+    def test_tls_setup_refuses_a_project_local_root_ca(self):
+        with tempfile.TemporaryDirectory() as project:
+            driver = FakeDriver(project)
+            args = type("Args", (), {
+                "sub": "setup",
+                "hostname": [],
+            })()
+            response = subprocess.CompletedProcess(
+                ["mkcert", "-CAROOT"], 0,
+                os.path.join(project, ".autohub", "ca") + "\n", "")
+            result = autohub.Result("tls")
+            with mock.patch.object(autohub.shutil, "which",
+                                   return_value="/usr/local/bin/mkcert"), \
+                    mock.patch.object(autohub.subprocess, "run",
+                                      return_value=response) as run:
+                autohub.cmd_tls(driver, {}, args, result)
+            self.assertFalse(result.ok)
+            self.assertEqual(run.call_count, 1)
+            self.assertIn("root CA inside the project", result.details[-1])
+
+    def test_scaffold_ignores_and_mounts_trusted_local_tls(self):
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, ".gitignore"), encoding="utf-8") as f:
+            ignore = f.read()
+        with open(os.path.join(root, "docker-compose.yml"),
+                  encoding="utf-8") as f:
+            compose = f.read()
+        self.assertIn("/.autohub/", ignore)
+        self.assertIn("rootCA-key.pem", ignore)
+        self.assertIn("${HUB_TLS_PATH:-hub_tls}:/etc/hubzero/tls", compose)
+
+    def test_host_trust_check_does_not_confuse_http_error_with_tls_error(self):
+        response = subprocess.CompletedProcess(
+            ["curl"], 0, "500", "")
+        with mock.patch.object(autohub.shutil, "which",
+                               return_value="/usr/bin/curl"), \
+                mock.patch.object(autohub.subprocess, "run",
+                                  return_value=response) as run:
+            trusted, detail = autohub._host_https_trust(
+                "https://localhost:8443/")
+        self.assertTrue(trusted)
+        self.assertIn("HTTP 500", detail)
+        self.assertNotIn("--fail", run.call_args.args[0])
 
 
 if __name__ == "__main__":

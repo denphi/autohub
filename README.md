@@ -13,6 +13,8 @@ JSON results, deployment-driver abstraction, and safety checks.
 
 - Creates a new AutoHub project from the bundled deployment scaffold.
 - Initializes and starts HUBzero on Docker Compose or Kubernetes.
+- Configures browser-trusted local Docker HTTPS and verifies host trust without
+  insecure bypasses.
 - Establishes a health baseline before changing an existing hub.
 - Diagnoses site, asset, mail, login, and database failures.
 - Applies declarative hub configuration from `hub.yml`.
@@ -83,9 +85,11 @@ From this repository, copy the immutable scaffold into a new or empty target:
 python3 scripts/create_project.py ../research-hub --json
 cd ../research-hub
 cli/autohub init --site "Research Hub" --json
+cli/autohub tls setup --json
 cli/autohub template create --name researchhub --json
 cli/autohub assets lint --json
 cli/autohub up --wait --json
+cli/autohub verify --scope tls --json
 cli/autohub verify --json
 ```
 
@@ -95,6 +99,12 @@ Docker Compose namespace, probes published ports, and does not print secrets.
 
 First boot can take several minutes while the CMS source, dependencies, schema,
 configuration, and assets are prepared.
+
+Local trusted HTTPS uses mkcert. Its first setup installs a local CA into the
+host trust stores and may request administrator credentials, so an agent must
+obtain authorization before running it. The ignored `.autohub/tls/` directory
+contains the project leaf certificate and key. Never copy or commit mkcert's
+`rootCA-key.pem`.
 
 ## Architecture
 
@@ -144,6 +154,8 @@ AutoHub treats operational verification as part of every change:
   changed.
 - Passwords, tokens, sessions, private keys, and `.env` contents must never be
   reproduced in output or commits.
+- A certificate warning is a failed local deployment prerequisite; browser QA
+  must not silently switch to HTTP and claim completion.
 - Database dumps are identified as database-only; they are not presented as
   complete disaster-recovery backups.
 - Template changes require browser inspection because successful compilation
@@ -169,7 +181,10 @@ Creating a project from the bundled scaffold requires Python 3; the creator
 uses only the standard library.
 
 For Docker deployments, the generated project requires Docker Engine 20.10 or
-newer with Compose v2. The image supports `amd64` and `arm64`.
+newer with Compose v2. The image supports `amd64` and `arm64`. Browser-trusted
+local HTTPS additionally requires
+[mkcert](https://github.com/FiloSottile/mkcert); Firefox may require its
+platform-specific NSS package.
 
 Kubernetes deployments require access to the selected cluster plus `kubectl`
 and Helm. Ingress and certificate management depend on the generated project's

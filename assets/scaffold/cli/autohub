@@ -21,6 +21,7 @@ import datetime
 import errno
 import hashlib
 import html
+import ipaddress
 import json
 import os
 import re
@@ -469,7 +470,8 @@ class Result:
 
 
 # ---------------------------------------------------------------------------
-# http helpers (self-signed TLS — verification off on purpose)
+# HTTP helpers used for application checks. Certificate trust is verified
+# separately so trust failures stay distinguishable from application failures.
 # ---------------------------------------------------------------------------
 
 def http_get(url, timeout=20, headers=None):
@@ -641,7 +643,9 @@ def _restore_snapshot(drv, path, metadata, res):
         return False
 
     tls = drv.stream_from_file("web", ["bash", "-c",
-        'set -e; rm -rf /etc/hubzero/tls; tar -xzf - -C /etc/hubzero'],
+        'set -e; install -d -m 700 /etc/hubzero/tls; '
+        'find /etc/hubzero/tls -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; '
+        'tar -xzf - -C /etc/hubzero'],
         os.path.join(path, "hub_tls.tar.gz"))
     if tls.returncode != 0:
         res.fail("TLS restore failed: " + scrub(tls.stderr).strip())
@@ -668,6 +672,200 @@ def _restore_snapshot(drv, path, metadata, res):
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
+
+def _validated_tls_hostnames(requested, env):
+    names = list(requested or [])
+    if not names:
+        names.append(env.get("HUB_TLS_CN", "localhost") or "localhost")
+    names.extend(["localhost", "127.0.0.1", "::1"])
+    valid = []
+    for raw in names:
+        name = str(raw).strip()
+        if not name or name.startswith("-"):
+            raise Exception("invalid TLS hostname: %r" % raw)
+        try:
+            ipaddress.ip_address(name)
+        except ValueError:
+            if len(name) > 253 or not re.fullmatch(
+                    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+                    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",
+                    name):
+                raise Exception("invalid TLS hostname: " + name)
+        if name not in valid:
+            valid.append(name)
+    return valid
+
+
+def _tls_host_path(project_dir, env):
+    configured = env.get("HUB_TLS_PATH", "hub_tls")
+    if configured == "hub_tls":
+        return None
+    return os.path.realpath(
+        configured if os.path.isabs(configured)
+        else os.path.join(project_dir, configured))
+
+
+def _mkcert_install_hint():
+    if sys.platform == "darwin":
+        return "install mkcert with `brew install mkcert`; add `brew install nss` for Firefox"
+    if os.name == "nt":
+        return "install mkcert with Chocolatey or Scoop"
+    return "install mkcert and the platform NSS/certutil package (for example libnss3-tools)"
+
+
+def _host_https_trust(url):
+    curl = shutil.which("curl")
+    if curl:
+        result = subprocess.run(
+            [curl, "--silent", "--show-error", "--output", os.devnull,
+             "--write-out", "%{http_code}", "--max-time", "25", url],
+            capture_output=True, text=True)
+        detail = result.stderr.strip()
+        if result.returncode == 0:
+            detail = "host trust store accepted certificate (HTTP %s)" % (
+                result.stdout.strip() or "unknown")
+        return result.returncode == 0, scrub(detail)
+    try:
+        with urllib.request.urlopen(url, timeout=25) as response:
+            return True, "default TLS trust accepted HTTP %s" % response.status
+    except urllib.error.HTTPError as exc:
+        return True, "default TLS trust accepted HTTP %s" % exc.code
+    except Exception as exc:
+        return False, scrub(str(exc))
+
+
+def _inspect_local_certificate(project_dir, env, res):
+    path = _tls_host_path(project_dir, env)
+    if path is None:
+        res.check("trusted local certificate configured", False,
+                  "HUB_TLS_PATH still uses the self-signed hub_tls volume")
+        res.suggest("cli/autohub tls setup --json")
+        return False
+    cert = os.path.join(path, "hub.crt")
+    key = os.path.join(path, "hub.key")
+    files_ok = os.path.isfile(cert) and os.path.getsize(cert) > 0 \
+        and os.path.isfile(key) and os.path.getsize(key) > 0
+    res.check("TLS certificate and key", files_ok, path)
+    if not files_ok:
+        res.suggest("cli/autohub tls setup --json")
+        return False
+    key_mode = os.stat(key).st_mode & 0o777
+    res.check("TLS private key is not world-accessible", key_mode & 0o007 == 0,
+              "%s mode %03o" % (key, key_mode))
+    openssl = shutil.which("openssl")
+    if openssl:
+        check = subprocess.run(
+            [openssl, "x509", "-in", cert, "-checkend", "86400", "-noout"],
+            capture_output=True, text=True)
+        res.check("TLS certificate valid beyond 24 hours", check.returncode == 0,
+                  scrub((check.stderr or check.stdout).strip()))
+        cert_public = subprocess.run(
+            [openssl, "x509", "-in", cert, "-pubkey", "-noout"],
+            capture_output=True)
+        key_public = subprocess.run(
+            [openssl, "pkey", "-in", key, "-pubout"],
+            capture_output=True)
+        pair_ok = cert_public.returncode == 0 and key_public.returncode == 0 \
+            and cert_public.stdout == key_public.stdout
+        pair_detail = (cert_public.stderr or key_public.stderr or b"").decode(
+            "utf-8", "replace").strip()
+        res.check("TLS certificate matches private key", pair_ok,
+                  scrub(pair_detail))
+        details = subprocess.run(
+            [openssl, "x509", "-in", cert, "-noout",
+             "-subject", "-issuer", "-dates", "-ext", "subjectAltName"],
+            capture_output=True, text=True)
+        for line in scrub(details.stdout or "").splitlines():
+            if line.strip():
+                res.say(line.strip())
+    return files_ok
+
+
+def cmd_tls(drv, env, args, res):
+    if drv.name != "docker":
+        res.fail("local mkcert TLS setup applies only to the Docker driver; configure trusted Ingress TLS for Kubernetes")
+        return res
+    if args.sub == "status":
+        _inspect_local_certificate(drv.dir, env, res)
+        ok, detail = _host_https_trust(drv.url() + "/")
+        res.check("HTTPS trusted by host", ok, detail)
+        return res
+
+    mkcert = shutil.which("mkcert")
+    if not mkcert:
+        res.fail("mkcert is required: " + _mkcert_install_hint())
+        return res
+    names = _validated_tls_hostnames(args.hostname, env)
+
+    caroot_result = subprocess.run(
+        [mkcert, "-CAROOT"], cwd=drv.dir, capture_output=True, text=True)
+    caroot_text = (caroot_result.stdout or "").strip()
+    if caroot_result.returncode != 0 or not caroot_text:
+        res.fail("mkcert could not report its CA storage directory")
+        return res
+    caroot = os.path.realpath(caroot_text.splitlines()[-1])
+    project = os.path.realpath(drv.dir)
+    try:
+        caroot_in_project = os.path.commonpath([project, caroot]) == project
+    except ValueError:
+        caroot_in_project = False
+    if caroot_in_project:
+        res.fail("refusing to keep mkcert's root CA inside the project; unset CAROOT or move it to protected user storage")
+        return res
+
+    installed = subprocess.run(
+        [mkcert, "-install"], cwd=drv.dir, capture_output=True, text=True)
+    install_output = scrub(
+        (installed.stdout or "") + (installed.stderr or "")).strip()
+    res.check("mkcert local CA installed", installed.returncode == 0,
+              install_output)
+    if installed.returncode != 0:
+        res.fail("mkcert could not install its local CA")
+        res.say("CA installation changes the host trust store and may require an interactive administrator approval")
+        return res
+
+    tls_dir = os.path.join(drv.dir, ".autohub", "tls")
+    os.makedirs(tls_dir, mode=0o700, exist_ok=True)
+    os.chmod(tls_dir, 0o700)
+    cert_tmp = os.path.join(tls_dir, "hub.crt.tmp")
+    key_tmp = os.path.join(tls_dir, "hub.key.tmp")
+    for path in (cert_tmp, key_tmp):
+        if os.path.exists(path):
+            os.unlink(path)
+    issued = subprocess.run(
+        [mkcert, "-cert-file", cert_tmp, "-key-file", key_tmp] + names,
+        cwd=drv.dir, capture_output=True, text=True)
+    issue_output = scrub(
+        (issued.stdout or "") + (issued.stderr or "")).strip()
+    generated = issued.returncode == 0 \
+        and os.path.isfile(cert_tmp) and os.path.getsize(cert_tmp) > 0 \
+        and os.path.isfile(key_tmp) and os.path.getsize(key_tmp) > 0
+    res.check("trusted localhost certificate issued", generated, issue_output)
+    if not generated:
+        for path in (cert_tmp, key_tmp):
+            if os.path.exists(path):
+                os.unlink(path)
+        res.fail("mkcert could not issue the project certificate")
+        return res
+
+    cert = os.path.join(tls_dir, "hub.crt")
+    key = os.path.join(tls_dir, "hub.key")
+    os.replace(cert_tmp, cert)
+    os.replace(key_tmp, key)
+    os.chmod(cert, 0o644)
+    os.chmod(key, 0o600)
+    update_env(drv.dir, {
+        "HUB_TLS_PATH": "./.autohub/tls",
+        "HUB_TLS_MODE": "mkcert",
+        "HUB_TLS_CN": names[0],
+    })
+    res.check("Docker trusted TLS configured", True,
+              ".autohub/tls/hub.crt and hub.key")
+    res.say("the mkcert root CA key remains in mkcert's protected CAROOT; never copy or commit it")
+    res.suggest("cli/autohub up --wait --json")
+    res.suggest("cli/autohub tls status --json")
+    return res
+
 
 def _port_available(port):
     """Check wildcard IPv4 and IPv6 binds, matching Docker publication."""
@@ -754,6 +952,7 @@ def cmd_init(drv, env, args, res):
     if r.returncode != 0:
         res.fail(scrub(r.stderr.strip()))
     else:
+        res.suggest("cli/autohub tls setup --json")
         res.suggest("cli/autohub up --wait --json")
     return res
 
@@ -823,7 +1022,10 @@ def cmd_destroy(drv, env, args, res):
     if r.returncode != 0:
         res.fail("destroy failed: " + scrub(r.stderr or r.stdout).strip())
         return res
-    res.say("stack destroyed: all managed volumes/PVCs deleted, including source, app data, database, TLS and in-cluster backups")
+    res.say("stack destroyed: managed volumes/PVCs deleted, including source, app data, database, volume-backed TLS and in-cluster backups")
+    if env.get("HUB_TLS_PATH", "").startswith(("./", "../")):
+        res.say("project-local TLS files were retained outside Docker volumes: "
+                + env["HUB_TLS_PATH"])
     res.say("recovery snapshot retained on the host: " + snapshot)
     res.suggest("cli/autohub up --wait --json")
     return res
@@ -1008,6 +1210,14 @@ def _sweep_page_assets(base, page_url, body):
 def cmd_verify(drv, env, args, res):
     base = drv.url()
     scope = args.scope
+
+    if scope in ("all", "tls"):
+        if drv.name == "docker":
+            _inspect_local_certificate(drv.dir, env, res)
+        trusted, detail = _host_https_trust(base + "/")
+        res.check("HTTPS certificate trusted by host", trusted, detail)
+        if not trusted and drv.name == "docker":
+            res.suggest("cli/autohub tls setup --json")
 
     if scope in ("all", "site"):
         for path, want in [("/", 200), ("/administrator/", 200)]:
@@ -1559,7 +1769,8 @@ def build_parser():
 
     s = add("verify", help="prove the hub actually works")
     s.add_argument("--scope", default="all",
-                   choices=["all", "site", "assets", "components", "mail", "login", "db"])
+                   choices=["all", "site", "assets", "components", "tls",
+                            "mail", "login", "db"])
     s.add_argument("--route", action="append", default=[],
                    help="additional public route to verify; repeat as needed")
     s.set_defaults(fn=cmd_verify)
@@ -1612,6 +1823,12 @@ def build_parser():
                    help="container env var holding the push token (default GITLAB_TOKEN)")
     s.add_argument("--force", action="store_true", help="push with --force-with-lease")
     s.set_defaults(fn=cmd_template)
+
+    s = add("tls", help="configure or inspect browser-trusted local HTTPS")
+    s.add_argument("sub", choices=["setup", "status"])
+    s.add_argument("--hostname", action="append", default=[],
+                   help="additional DNS name or IP for the certificate; repeat as needed")
+    s.set_defaults(fn=cmd_tls)
 
     s = add("update", help="pull the CMS ref and migrate")
     s.add_argument("--ref")

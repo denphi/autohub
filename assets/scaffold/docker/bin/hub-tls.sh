@@ -1,13 +1,15 @@
 #!/bin/bash
-# Make sure a TLS certificate exists, generating a self-signed one if needed.
+# Make sure a TLS certificate exists, generating a self-signed fallback if
+# `autohub tls setup` or an operator has not mounted a trusted pair.
 #
 # HUBzero does not treat HTTPS as optional: com_login's auth controller
 # hardcodes a redirect to https:// with no config to disable it, so *nobody can
 # log in* over plain HTTP. A hub without TLS is not merely less secure, it is
 # unusable.
 #
-# Mount real certificates at $HUB_TLS_DIR to replace the generated pair; this
-# script leaves anything already there alone.
+# `autohub tls setup` mounts a locally trusted development pair. Production
+# operators can mount a publicly trusted pair at $HUB_TLS_DIR. This script
+# leaves anything already there alone.
 
 # shellcheck source=lib.sh
 . "$(dirname "$(readlink -f "$0")")/lib.sh"
@@ -27,8 +29,8 @@ fi
 
 log "generating a self-signed certificate for '$HUB_TLS_CN' (replace it for production)"
 
-# SANs matter: browsers ignore CN, and without them the cert is rejected even
-# after the user accepts the self-signed warning.
+# SANs matter: browsers ignore CN. This fallback includes the common local
+# names, but its issuer is intentionally not installed into host trust stores.
 openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
 	-keyout "$key" -out "$crt" \
 	-subj "/CN=${HUB_TLS_CN}" \

@@ -77,9 +77,10 @@ services:
       # PATH_APP: config, uploads, logs, cache, sessions. Nested inside hub_src
       # so a source reset never destroys site data.
       - hub_app:/var/www/html/app
-      # Mount real certificates here (hub.crt / hub.key) to replace the
-      # self-signed pair generated on first boot.
-      - hub_tls:/etc/hubzero/tls
+      # Defaults to the managed hub_tls volume and its generated self-signed
+      # pair. `autohub tls setup` switches HUB_TLS_PATH to an ignored host
+      # directory containing a browser-trusted mkcert leaf certificate.
+      - ${HUB_TLS_PATH:-hub_tls}:/etc/hubzero/tls
       # Declarative hub setup. Deliberately NOT under app/: that tree is runtime
       # state the entrypoint chowns, and a read-only mount inside it makes
       # `chown -R` fail and crashloop the container. `make up` creates an empty
