@@ -86,8 +86,26 @@ miss when the override is small: a 15-line `media.css` silently replaced core's
 671-line media-manager styling on one hub, and a commented-out import left a
 component running entirely on template CSS.
 
-Audit with a size comparison — an override much smaller than its core
-counterpart and lacking an `@import` is the signature.
+Audit by reading the file, and beware two traps that produce false positives:
+
+- **The import may be relative.** `@import url("../../../../../core/components/…")`
+  is as valid as the absolute form. Grepping for `/core/` alone reports healthy
+  files as broken.
+- **An `@import`ed sheet is not a `<link>`.** The browser fetches it as a
+  sub-resource of the importing file, so it never appears in the page's link
+  tags. You cannot confirm or refute this from rendered HTML; check the
+  stylesheet itself.
+
+Then classify before acting. Compare the override's selectors against core's:
+
+| Overlap | Meaning | Action |
+|---|---|---|
+| Few or none | Additive; core's styling is genuinely lost | Add the import |
+| Most | A fork of core's file | Adding an import duplicates rules — reduce it to what actually differs instead |
+| All, values identical | A stale copy | Delete it and let core render |
+
+A size comparison alone cannot tell these apart, and adding an import to a fork
+makes the file worse, not better.
 
 ## Win the cascade deliberately
 
@@ -273,6 +291,14 @@ of overriding the view, and propose one upstream where it is missing.
   once (`self::$instances`); overrides that drop that logic emit repeated
   `id="searchform"` / `id="searchword"`. Grep rendered output for
   `id="…"` counts.
+- **Preserve line endings.** A template can carry files with different line
+  endings — one CRLF file among LF siblings is common in a codebase with a long
+  history. A scripted edit that reads and rewrites the whole file converts them
+  silently, and every line then registers as changed: the real edit disappears
+  into a whole-file diff, review becomes impossible, and a merge conflicts on
+  untouched lines. Check `file <path>` before and after, and rewrite with the
+  original endings. Reviewing your own diff catches it — a twelve-line change
+  that reports the entire file as modified is the signature.
 - **Confirm against rendered output.** After deploying, fetch the route and
   check for a marker only the new code emits. Comparing `Last-Modified` on a
   static asset distinguishes "my change is wrong" from "my change is not
