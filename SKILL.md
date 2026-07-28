@@ -37,6 +37,12 @@ while a required check failed, was skipped, or still needs visual inspection.
 - Read [references/native-component-styling.md](references/native-component-styling.md)
   before creating or changing a site template. It defines the mandatory
   native-component styling and browser acceptance matrix.
+- Read [references/template-override-mechanics.md](references/template-override-mechanics.md)
+  before overriding a core view, stylesheet, or script, and before auditing
+  overrides a hub already carries. It covers the failures that produce no error:
+  unreachable overrides, asset paths the loader ignores, stylesheets that
+  replace core instead of layering, cascade and `!important` conflicts, and
+  scripts that run before the body exists.
 
 ## Create a project
 
@@ -309,6 +315,15 @@ Run the host-side lint before startup and replace them with compatible width,
 max-width, height, or min-height constraints. Only `site.less` auto-compiles.
 Rebuild paired template, vendor, group, and course-layout assets. Inspect load
 order and specificity, and hard-reload static assets that lack a version query.
+
+When the change overrides a core view, stylesheet, or script, follow
+[references/template-override-mechanics.md](references/template-override-mechanics.md).
+Prove the override is reachable before rebasing it, place assets at
+`html/<extension>/<file>` where the loader resolves them, import core's
+stylesheet before layering on it, and remember that component and plugin CSS
+loads *after* the template's and often scopes under an id. Confirm a deployed
+change by fetching the route and matching a marker only the new code emits —
+"my change is wrong" and "my change is not deployed" look identical otherwise.
 
 Before publishing template commits, run `template status --json` and review the
 branch, remote, ahead/behind state, and dirty files. Push only when the user

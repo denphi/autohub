@@ -59,6 +59,17 @@ Use narrowly scoped `html/<component>/` overrides only when the component markup
 cannot be styled safely. Overrides may change presentation, not record
 ownership, routing, or permissions.
 
+Prefer a stylesheet rule to a view override wherever the difference is
+presentational: CSS can restyle, show/hide, reorder within a formatting context,
+and add pseudo-content, and it does not block core upgrades. It cannot change
+data or text, add or remove attributes, unwrap an element, or alter logic — take
+the override for those. Before writing either, read
+[template-override-mechanics.md](template-override-mechanics.md): component and
+plugin stylesheets load *after* the template's and frequently scope under an id,
+so a rule that looks correct can never apply, and a stylesheet override that
+omits `@import url("/core/…")` silently discards all of core's styling for that
+extension.
+
 ## Keep branded page styles scoped
 
 Place expressive hero typography, cards, diagrams, and landing-page grids under
@@ -77,7 +88,19 @@ Use one visible semantic page title:
 
 Use base-URL-aware helpers for template assets. Avoid hard-coded
 `/app/templates/...` paths because deployment subpaths and template runtime
-locations can differ.
+locations can differ — a protected template resolves under `/core`, and the
+directory name changes when the template is renamed:
+
+```php
+(App::get('template')->protected ? '/core' : '/app')
+    . '/templates/' . App::get('template')->template . '/js/…'
+```
+
+For component, plugin, and module assets prefer
+`\Hubzero\Document\Assets::addPluginScript()` and its stylesheet counterpart,
+which resolve the template override themselves. Note that a file placed outside
+the path they resolve — `html/<extension>/<file>`, with no view directory — is
+skipped without an error.
 
 ## Test the route and state matrix
 
@@ -128,6 +151,11 @@ cli/autohub verify --scope components \
 
 The component verification scope checks HTTP responses and sweeps linked CSS,
 JavaScript, images, and fonts. It cannot prove layout or computed styling.
+
+When the hub carries template overrides, also audit them: every override
+reachable, every stylesheet override importing its core counterpart, no
+duplicate DOM ids from stripped instance suffixes, and no hard-coded template
+paths. See [template-override-mechanics.md](template-override-mechanics.md).
 
 Use browser inspection to confirm:
 
