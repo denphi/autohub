@@ -86,6 +86,9 @@ services:
       # state the entrypoint chowns, and a read-only mount inside it makes
       # `chown -R` fail and crashloop the container. `make up` creates an empty
       # hub.yml if absent -- the file must exist or Docker mounts a directory.
+      # Beware: Docker Desktop can keep the old inode view after the host file
+      # is rewritten; `autohub provision` detects the mismatch and asks for
+      # `down` then `up` (`up` alone does not remount a single-file bind).
       - ./hub.yml:/etc/hubzero/hub.yml:ro
       # User-approved import root for Resources/Publications attachments.
       # It is read-only; adapters copy validated files into component storage.

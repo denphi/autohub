@@ -104,11 +104,31 @@ components:
 # Do NOT rely on HUB_LOAD_SAMPLE_DATA for these: sample.sql's resource_types
 # rows supply 8 values for a 10-column table and fail to load at all.
 #
+# Do NOT define a `Tools` type here: com_resources dispatches it through
+# HUBzero's tool/middleware stack, which this scaffold does not run, so every
+# tool-type detail page renders an empty <main> -- 200 OK, no error, no log
+# line. Model tools as datasets/downloads, or deploy real middleware first.
+#
+# `params:` merges into the type's existing params (never replaces). Newly
+# created types default plg_about: 1; without it plgResourcesAbout contributes
+# no page area and every detail page renders title-only with the body stored
+# but invisible.
+#
 # Keep this example small; define only the types required by your deployment.
+#
+# Keep every `{ ... }` entry on ONE line. The CMS pins symfony/yaml 3.4, which
+# cannot parse a flow mapping spanning multiple lines ("Malformed inline YAML
+# string") -- and a manifest that fails to parse provisions nothing at all.
+# Use block style, as below, whenever an entry outgrows a single line.
 resource_types:
   - { id: 1, alias: publications, type: Publications, category: 27, state: 1 }
-  - { id: 2, alias: datasets,     type: Datasets,     category: 27, state: 1 }
-  - { id: 3, alias: tools,        type: Tools,        category: 27, state: 1 }
+  - id: 2
+    alias: datasets
+    type: Datasets
+    category: 27
+    state: 1
+    params:
+      plg_about: 1
 
 # --- Example content --------------------------------------------------------
 # General site pages belong in native com_content articles, not PHP files in a
@@ -116,6 +136,11 @@ resource_types:
 # are matched on alias; `content` is the complete body for a single-page item.
 # This example uses an authored h1 plus the com_content options above. Render
 # exactly one visible h1; do not hide duplicate native chrome with route CSS.
+#
+# An article alias must not match a native component route (support, resources,
+# groups, members, search, login, register, tags): the article would shadow the
+# component -- /support serves the article and the ticketing component becomes
+# unreachable while still returning HTTP 200. Provisioning rejects these.
 articles:
   - title: Home
     alias: home
@@ -134,15 +159,17 @@ articles:
       <h1>About this hub</h1>
       <p>Describe the hub's mission, community, and governance here.</p>
 
-# Datasets, tools, publications, and other catalogued research objects belong
-# in com_resources. New manifests should use a stable alias; title matching is
-# retained only for backward compatibility. `type` is a resource_type alias.
+# Datasets, downloads, publications, and other catalogued research objects
+# belong in com_resources. New manifests should use a stable alias; title
+# matching is retained only for backward compatibility. `type` is a
+# resource_type alias (and must not be a middleware-backed Tools type; see the
+# resource_types note above).
 resources:
-  - alias: example-simulation-tool
-    title: Example Simulation Tool
-    type: tools
+  - alias: example-dataset
+    title: Example Dataset
+    type: datasets
     published: 1
-    introtext: A placeholder tool resource created by hub-provision.
+    introtext: A placeholder dataset resource created by hub-provision.
     fulltxt: >
       Replace this with real content, or drop the `resources:` section
       entirely once the hub has its own.
@@ -207,8 +234,8 @@ users:
 #             title: Reading
 #             content: "<p>Introduction to flower structures.</p>"
 #           - type: resource
-#             title: Explore the example tool
-#             resource: example-simulation-tool
+#             title: Explore the example dataset
+#             resource: example-dataset
 
 # --- Modules ----------------------------------------------------------------
 # Position matters more than it looks: a module in a position the active
@@ -231,7 +258,14 @@ modules:
 #                 items stay recoverable)
 #
 # `home: true` marks the front page; exactly one site item may have it.
-# Aliases need only be unique among siblings, not across the whole menu.
+# The database enforces alias uniqueness on (client_id, parent_id, alias,
+# language) -- across ALL menutypes. Two items may share an alias only under
+# different parents; declaring an alias that exists in another menu adopts
+# that row into the declared menu rather than inserting a duplicate.
+#
+# `params:` merges into the item's existing params. The shipped `home` row
+# carries show_page_heading: 1, which stacks a second <h1> above an article
+# that supplies its own -- switch it off from the manifest.
 menus:
   site:
     prune: true
@@ -240,13 +274,15 @@ menus:
         alias: home
         article: home          # resolves to a native com_content article by alias
         home: true
+        params:
+          show_page_heading: 0
 
       - title: Explore
         alias: explore
         link: index.php?option=com_resources
         children:
-          - { title: Tools,     alias: tools,     link: /resources/tools, type: url }
-          - { title: Resources, alias: resources, link: "index.php?option=com_resources" }
+          - { title: Datasets,  alias: datasets,  link: /resources/datasets, type: url }
+          - { title: Browse,    alias: browse,    link: "index.php?option=com_resources" }
 
 # A component link (the default `type`) is resolved to its component_id.
 # Leaving that unset does not merely lose metadata -- the router then serves a

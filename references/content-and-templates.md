@@ -7,6 +7,7 @@ renders those components.
 ## Contents
 
 - [Choose the native owner](#choose-the-native-owner)
+- [Write for the hub's locale](#write-for-the-hubs-locale)
 - [Provision articles](#provision-articles)
 - [Connect menus to articles](#connect-menus-to-articles)
 - [Build a template](#build-a-template)
@@ -39,6 +40,22 @@ Use an installed domain component when it owns the concept. For example, use
 native groups rather than writing group cards that merely look interactive.
 Presentation may summarize native records, but the canonical record must still
 exist in the component.
+
+## Write for the hub's locale
+
+Settle the language and regional variant before authoring — British English,
+American English, Spanish, and so on — and ask the user when the request does
+not make it unambiguous. It decides spelling, punctuation, date and number
+formats, and terminology in every article, menu title, template string, and
+metadata description, and retrofitting it means rewriting all of them.
+
+Mechanically, each article and menu item carries a `language` field that
+defaults to `*` (all languages). Leave it at `*` for a single-language hub and
+express the locale in the prose itself. Set it explicitly only when the hub
+genuinely serves several languages — and note that `#__menu`'s unique key
+includes `language`, so per-language menu items legitimately share an alias
+under the same parent. Aliases and route paths remain lowercase ASCII whatever
+the content language.
 
 ## Provision articles
 
@@ -77,6 +94,15 @@ Prefer stable aliases over pinned ids. Pin an id only when another durable
 external contract requires it. The provisioner rejects an id/alias collision
 instead of overwriting unrelated content.
 
+Never give an article an alias that matches a native component route
+(`support`, `resources`, `groups`, `members`, `search`, `login`, `register`,
+`tags`): the article shadows the component — `/support` serves the article, the
+ticketing component becomes unreachable, and every reachability check still
+passes because the route answers HTTP 200. A hub's "Submit a ticket" page
+pointing back at itself is the observed symptom. The provisioner rejects an
+alias matching any enabled component, and the architecture audit flags the
+reserved names before provisioning.
+
 Store prose, semantic content markup, links, and content-specific media
 references in the article. Store shared styles and behavior in the template.
 Do not embed secrets, environment-specific hostnames, or generated credentials.
@@ -100,6 +126,8 @@ menus:
         alias: home
         article: home
         home: true
+        params:
+          show_page_heading: 0
 
       - title: About
         alias: about
@@ -109,6 +137,17 @@ menus:
 Provisioning resolves each alias to a published `#__content` row and writes the
 normal `com_content` article link with the correct component id. A missing or
 unpublished article fails that menu step rather than creating a dead route.
+
+Menu aliases are unique on `(client_id, parent_id, alias, language)` — across
+**all** menutypes, not per menu. Declaring an alias that already exists under
+the same parent in another menu (for example the CMS's shipped `mainmenu` Home
+row) adopts that row into the declared menu instead of inserting a duplicate.
+An adopted row keeps its params, which is why the `params:` map matters: it
+merges into the item's existing params, and the shipped `home` row carries
+`show_page_heading: 1` — a second `<h1>` above an article that supplies its
+own, unfixable from the manifest before `params:` existed. Provisioning also
+treats "no published default (home) item exists afterwards" as a hard failure,
+because that state 404s the front page.
 
 Use an explicit `link:` for other components, such as `com_resources` or
 `com_groups`. Use `type: url` only for a real external or intentionally raw
@@ -155,6 +194,15 @@ or shared template chrome, not from page-specific content files.
 Load assets through the document asset API and derive template image/script
 paths from the CMS base URL and active template name. Do not hard-code
 `/app/templates/<name>` URLs.
+
+`site.less` must begin by importing core's stylesheet
+(`@import "../../../../core/assets/less/site.less";`) — a template layers on
+core, it does not replace it. Constrain the main content column itself (the
+starter's `.ah-main`) rather than a fixed list of component wrapper classes:
+components emit wrappers a template cannot enumerate (`#content-header`,
+`section.section`, …), and anything missing from a child-selector width rule
+runs flush against the viewport edge. Never author `icon-`-prefixed classes —
+core fontcons claims that prefix.
 
 Keep native typography and controls restrained, then scope expressive
 landing-page design under a project-specific wrapper. Follow
@@ -213,8 +261,10 @@ python3 <skill-dir>/scripts/audit_site_architecture.py \
 This fails on missing baseline template files, template-side PHP pages,
 route-dispatch logic in `index.php`, template-side PHP catalogs, a missing
 component buffer, a `Pages` resource type, a missing native article section,
-missing shared native-component style surfaces, or hard-coded template asset
-paths in the PHP shell.
+a stylesheet that neither imports core's stylesheet nor defines the grid
+primitives, an article alias that shadows a native component route, missing
+shared native-component style surfaces, or hard-coded template asset paths in
+the PHP shell.
 
 After `cli/autohub provision --json`, run read-only checks such as:
 

@@ -218,7 +218,9 @@ components:
     allowUserRegistration: 1
 
 resource_types:                   # ids pinned so content stays portable
-  - { id: 7, alias: tools, type: Tools, category: 27, state: 1 }
+  # `params:` merges; new types default plg_about: 1 (bodies render). Avoid a
+  # middleware-backed Tools type -- its detail pages render blank here.
+  - { id: 2, alias: datasets, type: Datasets, category: 27, state: 1 }
 
 projects:  [...]                  # native team workspaces
 resources: [...]                  # datasets, tools, and downloads
@@ -429,6 +431,70 @@ handler logs the warning to `app/logs` *before* deciding whether to die.
 - The `cron` service runs `muse cron:jobs run` on a loop in its own container,
   so a failing job shows up in `docker compose logs cron` instead of taking the
   site down with it.
+- **The mounted `hub.yml` can go stale on both drivers.** Docker Desktop keeps
+  the old inode view of a single-file bind mount after the host file is
+  rewritten (a 70KB manifest can read back as a few hundred bytes, reported as
+  "manifest is empty"); on Kubernetes the manifest is a ConfigMap captured at
+  the last `up`, so `provision` alone re-applies the previous manifest and
+  reports success. `cli/autohub provision` and the component commands now
+  compare checksums and refuse to run against a stale mount — the remedy is
+  `down` then `up --wait` on Docker (`up` alone does not remount a single-file
+  bind), or `up` on Kubernetes (the chart's `checksum/manifest` annotation
+  rolls the pod).
+- **Menu aliases are globally unique per parent.** `#__menu`'s unique index is
+  `(client_id, parent_id, alias, language)` with no menutype, so a `hidden`
+  menu cannot re-declare an alias that exists in `mainmenu`; the provisioner
+  matches on the database's key and adopts the existing row instead of
+  inserting a duplicate.
+
+### Kubernetes driver notes
+
+- **Templates deploy from inside the image.** There are no bind mounts on a
+  cluster, and a ConfigMap cannot carry a template's binary assets past 1MB.
+  The image build COPYs the project `templates/` directory into
+  `/usr/local/share/hubzero-templates/`. After `template create` — or any
+  later template edit — rebuild and push the image (`HUB_IMAGE` in `.env`)
+  before `up`. On boot the entrypoint installs a template the `app/` volume
+  lacks and refreshes one it installed earlier when the image's copy has
+  changed, tracked by a `.autohub-baked` content stamp inside the template
+  directory. A template directory without that stamp was put there by
+  something else — a live local bind mount, an operator, a `hub.yml` extension
+  clone — and is never overwritten; the boot log says so explicitly.
+- **`templates/` must exist for the image to build.** `cli/autohub up` and the
+  Makefile create it, so a project scaffolded before templates were baked in
+  keeps building; a hand-rolled `docker build` in such a project needs
+  `mkdir templates` first, or the build aborts with "COPY failed".
+- **Tune the chart with `values_files:` in `autohub.yml`**, applied as `helm -f`
+  overlays before the driver's own `--set` flags. Editing `deploy/chart/values.yaml`
+  in place also works but mixes environment tuning into the shared chart. Any
+  other values file is ignored.
+- **Chart defaults fit a modest namespace quota**: ~8Gi of `requests.storage`
+  (src 3Gi, app 2Gi, tls 64Mi, db 3Gi; +10Gi when `backup.enabled`) and
+  ~3.75 CPU / ~3.4Gi memory of limits. Every container declares explicit
+  resources — on a real cluster "no limits" means "whatever the namespace
+  LimitRange says", which has been observed as 32Mi and an OOM-killed cron
+  loop.
+- **Upgrading a release installed with the older, larger storage defaults
+  requires pinning them.** Kubernetes never shrinks a PVC, and a StatefulSet's
+  `volumeClaimTemplates` are immutable, so `helm upgrade` refuses the smaller
+  values outright. Set
+  `values_files: deploy/existing-release-storage.yaml` under `kubernetes:` in
+  `autohub.yml`; that file ships with the previous sizes. `up` recognises the
+  resulting API error and points at this remedy. Only new installs get the
+  smaller defaults, and growing tls 16Mi → 64Mi additionally needs
+  `allowVolumeExpansion` on the storage class.
+- **The ingress forwards plain HTTP to the pod by default**
+  (`ingress.backendPort: http`) because most controllers terminate TLS
+  themselves; pointing them at the pod's https port yields
+  "400 You're speaking plain HTTP to an SSL-enabled server port" on every
+  route while the pod stays healthy. The vhost turns `X-Forwarded-Proto` into
+  `HTTPS=on`, which is what `com_login` needs. The chart also defaults
+  `nginx.ingress.kubernetes.io/force-ssl-redirect: "true"` — HUBzero's own
+  `force_ssl` covers parts of the admin flow, not the site, so HTTPS is
+  enforced at the controller.
+- **`helm uninstall` and `down` never delete PVCs.** After a failed install
+  they keep holding quota, which then fails the retry. `status` and `down`
+  list them; `destroy` (with its confirmation guards) removes them.
 
 ## Requirements
 

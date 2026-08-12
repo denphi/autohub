@@ -29,6 +29,38 @@ flows, or future content.
 
 ## Build the base layer first
 
+A template **layers on core's stylesheet; it does not replace it**. The first
+rule of `less/site.less` is:
+
+```less
+@import "../../../../core/assets/less/site.less";
+```
+
+Without that import the compiled `site.css` contains none of HUBzero's
+`.grid`/`.col.span*` system, `#content-header`, fontcons, tabs, notifications,
+or tooltips, and every native component route (`/resources`, `/groups`,
+`/members`, `/support`) renders with collapsed columns and unstyled chrome —
+while generic-selector checks still pass, because the template styles inputs
+and tables in general. A compiled stylesheet in the low tens of kilobytes is a
+red flag; the stock `welcome` template compiles to roughly 78KB. Core's
+variables are camelCase and do not collide with a template's own tokens, so the
+import is safe. The architecture audit fails a template whose stylesheet
+neither imports core nor defines the grid primitives itself.
+
+**`icon-` is a reserved class prefix.** Core's `icons.less` injects fontcons
+pseudo-elements into every element matching `*[class^="icon-"]` or
+`*[class*=" icon-"]`. A layout class such as `.icon-card` or `.icon-hero`
+therefore inherits invisible `::before` content — observed as a four-column
+grid rendering five items with an empty first cell, with nothing in any log.
+Use any other prefix for template classes; `template create` refuses an
+`icon-*` template name for the same reason.
+
+Constrain the main content column itself (the starter's `.ah-main`) rather
+than an enumerated list of component wrapper classes: components emit markup a
+template cannot predict (`#content-header`, `section.section`, …), and any
+wrapper missing from a child-selector width rule runs flush against the
+viewport edge.
+
 Keep unscoped rules restrained because they affect every component. Cover these
 shared surfaces before designing landing-page wrappers:
 

@@ -3,7 +3,20 @@
  * Keep the unscoped layer restrained: every public HUBzero component inherits
  * it. Add branded landing-page rules below a project-specific wrapper class.
  * The syntax deliberately targets HUBzero's legacy LesserPHP compiler.
+ *
+ * `icon-` is a reserved class prefix: core's icons.less injects fontcons
+ * ::before content into *[class^="icon-"] / *[class*=" icon-"], so a layout
+ * class such as .icon-card inherits an invisible pseudo-element that shifts
+ * grids with no error anywhere. Pick any other prefix for your own classes.
  */
+
+/* A template layers on core's stylesheet; it does not replace it. Without this
+ * import the compiled site.css contains none of HUBzero's .grid/.col.span*
+ * system, #content-header, fontcons, tabs, notifications or tooltips, and
+ * every native component route (/resources, /groups, /members, /support)
+ * renders with collapsed columns and unstyled chrome. Core's variables are
+ * camelCase and do not collide with this template's tokens. */
+@import "../../../../core/assets/less/site.less";
 
 @ink: #1e2933;
 @muted: #52616d;
@@ -92,13 +105,7 @@ figure {
 	margin-top: 0;
 }
 
-.ah-shell,
-.ah-main > .contentpane,
-.ah-main > .contentpaneopen,
-.ah-main > .item-page,
-.ah-main > .container,
-.ah-main > form,
-.ah-main > .component {
+.ah-shell {
 	width: 92%;
 	max-width: 78rem;
 	margin-right: auto;
@@ -160,7 +167,15 @@ figure {
 	background: @surface-soft;
 }
 
+/* Constrain the main column itself, not an enumerated list of child wrappers:
+ * native components emit markup this template cannot predict (#content-header,
+ * section.section, ...), and any wrapper missing from a child-selector list
+ * runs flush against the viewport edge. */
 .ah-main {
+	width: 92%;
+	max-width: 78rem;
+	margin-right: auto;
+	margin-left: auto;
 	min-height: 55vh;
 	padding-top: 2.5rem;
 	padding-bottom: 4rem;

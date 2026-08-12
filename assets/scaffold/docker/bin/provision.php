@@ -118,6 +118,45 @@ function attempt($label, callable $work)
 }
 
 /**
+ * Merge manifest params into a stored params blob, or refuse.
+ *
+ * `params:` promises a merge -- naming one key must never wipe the others.
+ * But HUBzero's Registry reads INI *and* JSON interchangeably, so a row
+ * written by older CMS code or an old migration can hold INI text. There
+ * json_decode returns null, and merging into (array) null would silently
+ * replace every existing setting with only the manifest's keys -- exactly the
+ * destruction this file promises never to do. Refuse instead, and say how to
+ * fix it.
+ *
+ * Returns the JSON to store. $stored is whatever the column currently holds.
+ */
+function merged_params_json($stored, array $params, $label)
+{
+	$stored = trim((string) $stored);
+
+	if (!$params)
+	{
+		return $stored !== '' ? $stored : '{}';
+	}
+
+	if ($stored === '' || $stored === '{}' || $stored === 'null')
+	{
+		return json_encode($params);
+	}
+
+	$current = json_decode($stored, true);
+
+	if (!is_array($current))
+	{
+		throw new Exception($label . ': stored params are not JSON (legacy INI'
+			. ' Registry format?); refusing to replace them -- re-save the record'
+			. ' once in the administrator UI, which rewrites it as JSON, then re-run');
+	}
+
+	return json_encode(array_merge($current, $params));
+}
+
+/**
  * Merge params into exactly one #__extensions row without clobbering the keys
  * already there.
  *
@@ -147,9 +186,9 @@ function merge_extension_params($db, array $where, array $params, $label)
 		throw new Exception($label . ' is not registered');
 	}
 
-	$merged = array_merge((array) json_decode((string) $current, true), $params);
+	$merged = merged_params_json($current, $params, $label);
 
-	$db->setQuery("UPDATE `#__extensions` SET `params` = " . $db->quote(json_encode($merged)) . "
+	$db->setQuery("UPDATE `#__extensions` SET `params` = " . $db->quote($merged) . "
 		WHERE " . $sql);
 	$db->query();
 }
@@ -474,11 +513,8 @@ if (!empty($manifest['modules']))
 
 			if (!empty($spec['params']))
 			{
-				$merged = array_merge(
-					(array) json_decode((string) $row->params, true),
-					(array) $spec['params']
-				);
-				$set[] = '`params` = ' . $db->quote(json_encode($merged));
+				$set[] = '`params` = ' . $db->quote(merged_params_json(
+					$row->params, (array) $spec['params'], "module '{$module}'"));
 			}
 
 			if (!$set)
@@ -700,6 +736,15 @@ if (!empty($manifest['resource_types']))
 				'state'         => isset($type['state']) ? (int) $type['state'] : 1,
 			);
 
+			// Type params gate whole detail-page areas: plgResourcesAbout
+			// renders the body only when the *type's* params contain plg_about,
+			// so a type with empty params shows every resource as title-only
+			// with no error anywhere. Merge (never replace) declared params,
+			// and default plg_about on for new types. The admin UI stores this
+			// column as JSON (Registry::toString).
+			$itemParams = (isset($type['params']) && is_array($type['params']))
+				? $type['params'] : array();
+
 			$set = array();
 
 			foreach ($fields as $column => $value)
@@ -709,6 +754,13 @@ if (!empty($manifest['resource_types']))
 
 			if ($existing)
 			{
+				if ($itemParams)
+				{
+					$db->setQuery("SELECT `params` FROM `#__resource_types` WHERE `id` = " . (int) $existing);
+					$set[] = '`params` = ' . $db->quote(merged_params_json(
+						$db->loadResult(), $itemParams, "resource type '{$alias}'"));
+				}
+
 				$db->setQuery("UPDATE `#__resource_types` SET " . implode(', ', $set)
 					. " WHERE `id` = " . (int) $existing);
 			}
@@ -718,6 +770,8 @@ if (!empty($manifest['resource_types']))
 				{
 					$set[] = '`id` = ' . $id;
 				}
+				$itemParams += array('plg_about' => 1);
+				$set[] = '`params` = ' . $db->quote(json_encode($itemParams));
 				$db->setQuery("INSERT INTO `#__resource_types` SET " . implode(', ', $set));
 			}
 
@@ -748,14 +802,32 @@ if (!empty($manifest['resources']))
 
 		attempt("resource {$title}", function () use ($resource, $title, $db)
 		{
+			$typeAlias = isset($resource['type']) ? trim((string) $resource['type']) : '';
+
+			if (!$typeAlias)
+			{
+				// Manifests used to rely on an implicit 'tools' default, which
+				// only ever resolved because the example manifest defined that
+				// type. It no longer does (com_resources dispatches Tools
+				// through middleware this scaffold does not run), so honour the
+				// legacy default only where the type actually exists rather
+				// than failing with a type the manifest never mentioned.
+				$db->setQuery("SELECT `alias` FROM `#__resource_types` WHERE `alias` = 'tools'");
+				$typeAlias = (string) $db->loadResult();
+
+				if (!$typeAlias)
+				{
+					throw new Exception("needs a 'type' naming one of the resource_types aliases");
+				}
+			}
+
 			$db->setQuery("SELECT `id` FROM `#__resource_types` WHERE `alias` = "
-				. $db->quote(isset($resource['type']) ? $resource['type'] : 'tools'));
+				. $db->quote($typeAlias));
 			$typeId = (int) $db->loadResult();
 
 			if (!$typeId)
 			{
-				throw new Exception("unknown resource type '"
-					. (isset($resource['type']) ? $resource['type'] : '?') . "'");
+				throw new Exception("unknown resource type '" . $typeAlias . "'");
 			}
 
 			$alias = isset($resource['alias']) ? trim((string) $resource['alias']) : '';
@@ -844,6 +916,20 @@ if (!empty($manifest['articles']))
 
 		attempt("article {$alias}", function () use ($article, $title, $alias, $db)
 		{
+			// An alias matching an enabled component's route shadows it
+			// silently: /support serves the article, com_support becomes
+			// unreachable, and the route still answers HTTP 200 so
+			// reachability checks pass. Refuse it outright.
+			$db->setQuery("SELECT COUNT(*) FROM `#__extensions`
+				WHERE `type` = 'component' AND `enabled` = 1
+				  AND `element` = " . $db->quote('com_' . strtolower($alias)));
+
+			if ((int) $db->loadResult())
+			{
+				throw new Exception("alias '{$alias}' would shadow the com_" . strtolower($alias)
+					. " component route /{$alias}; choose a different alias");
+			}
+
 			$id = isset($article['id']) ? (int) $article['id'] : 0;
 
 			// A pinned id must not overwrite an unrelated article or conflict with
@@ -1175,13 +1261,24 @@ function menuItem($db, $item, $type, $client, $order, $parentId, $parentPath, $l
         }
     }
 
-    // Scope the lookup to the parent. Aliases are unique among siblings, not
-    // across the tree -- matching on alias alone silently hijacks an unrelated
-    // item elsewhere in the menu and drags it nowhere.
+    // Look the row up on the same key the database enforces. #__menu's unique
+    // index is (client_id, parent_id, alias, language) -- with NO menutype --
+    // so a per-menutype lookup can decide to INSERT a row the index then
+    // rejects ("Duplicate entry '0-1-home-*'"). When the failing item carried
+    // home: true and prune had already retired the shipped row, the site was
+    // left with no default menu item and 404'd on '/'. Matching globally means
+    // an existing row in another menutype (e.g. the CMS's shipped mainmenu
+    // Home) is adopted into the declared menutype by the UPDATE below instead.
+    // Do NOT filter on language here: a row saved with a specific language
+    // (en-GB, say) is still a row this alias must update in place, and missing
+    // it inserts a second same-alias sibling with an identical computed path.
+    // Prefer the '*' row when several match, mirroring what gets written back.
     $db->setQuery("SELECT `id` FROM `#__menu`
-        WHERE `menutype` = " . $db->quote($type) . "
+        WHERE `client_id` = " . (int) $client . "
+          AND `parent_id` = " . (int) $parentId . "
           AND `alias` = " . $db->quote($alias) . "
-          AND `parent_id` = " . (int) $parentId);
+        ORDER BY (`language` = '*') DESC, `id` ASC
+        LIMIT 1");
     $existing = $db->loadResult();
 
     $fields = array(
@@ -1206,6 +1303,13 @@ function menuItem($db, $item, $type, $client, $order, $parentId, $parentPath, $l
         $set[] = '`' . $column . '` = ' . $db->quote($value);
     }
 
+    // `params:` merges into the item's existing params blob. Without this,
+    // params inherited from an adopted row are unreachable from the manifest
+    // -- most visibly the shipped `home` row's show_page_heading:1, which
+    // renders a second <h1> above an article that supplies its own.
+    $itemParams = (isset($item['params']) && is_array($item['params']))
+        ? $item['params'] : array();
+
     // Only one item per client may be the front page.
     if (!empty($item['home']))
     {
@@ -1215,6 +1319,13 @@ function menuItem($db, $item, $type, $client, $order, $parentId, $parentPath, $l
 
     if ($existing)
     {
+        if ($itemParams)
+        {
+            $db->setQuery("SELECT `params` FROM `#__menu` WHERE `id` = " . (int) $existing);
+            $set[] = '`params` = ' . $db->quote(merged_params_json(
+                $db->loadResult(), $itemParams, "menu item '{$alias}'"));
+        }
+
         $db->setQuery("UPDATE `#__menu` SET " . implode(', ', $set) . " WHERE `id` = " . (int) $existing);
         $db->query();
 
@@ -1236,7 +1347,7 @@ function menuItem($db, $item, $type, $client, $order, $parentId, $parentPath, $l
     $set[] = '`path` = ' . $db->quote(($parentPath ? $parentPath . '/' : '') . $alias);
     $set[] = '`lft` = ' . $edge;
     $set[] = '`rgt` = ' . ($edge + 1);
-    $set[] = '`params` = ' . $db->quote('{}');
+    $set[] = '`params` = ' . $db->quote($itemParams ? json_encode($itemParams) : '{}');
 
     $db->setQuery("INSERT INTO `#__menu` SET " . implode(', ', $set));
     $db->query();
@@ -1345,6 +1456,19 @@ if (!empty($manifest['menus']))
                 $changed++;
             }
         }
+    }
+
+    // A hub with no published default (home) item 404s on '/'. That happened
+    // in practice when the declared home item failed while prune had already
+    // retired the shipped row -- and it looked cosmetic ("1 failed") in the
+    // summary. Losing the front page is a hard provisioning failure.
+    $db->setQuery("SELECT COUNT(*) FROM `#__menu`
+        WHERE `client_id` = 0 AND `home` = 1 AND `published` = 1");
+
+    if (!(int) $db->loadResult())
+    {
+        $failed++;
+        fwrite(STDERR, "[hub]   FAILED menus: no published default (home) menu item exists after provisioning -- the site will 404 on /\n");
     }
 }
 

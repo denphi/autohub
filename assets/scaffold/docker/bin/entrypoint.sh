@@ -37,6 +37,50 @@ hub-source-sync
 # 3. Config: app/ tree + app/config/*.php rendered from the environment.
 hub-config-render
 
+# 3b. Templates baked into the image (see the Dockerfile: cluster deployments
+#     have no bind mounts).
+#
+#     Install a template the app/ volume lacks, and refresh one this container
+#     installed earlier when the image's copy has changed -- otherwise a
+#     template edit rebuilt into the image would never reach a cluster, which
+#     serves the first-installed version forever with nothing in the logs.
+#     The stamp file records which content we installed: a directory without
+#     one was put there by something else (a live bind mount, an operator, a
+#     `hub.yml` extension clone) and is never touched.
+for baked in /usr/local/share/hubzero-templates/*/; do
+	[ -d "$baked" ] || continue
+	name=$(basename "$baked")
+	target="$HUB_ROOT/app/templates/$name"
+	stamp="$target/.autohub-baked"
+	want=$(find "$baked" -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1)
+
+	if [ ! -d "$target" ] || [ -z "$(ls -A "$target" 2>/dev/null)" ]; then
+		action=install
+	elif [ ! -f "$stamp" ]; then
+		action=skip           # not ours: bind mount or operator-managed
+	elif [ "$(cat "$stamp" 2>/dev/null)" = "$want" ]; then
+		action=current
+	else
+		action=refresh
+	fi
+
+	case "$action" in
+		install|refresh)
+			# Safe to replace: either nothing is there, or the stamp says this
+			# is a copy we installed from a previous image.
+			mkdir -p "$target"
+			find "$target" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+			cp -R "${baked}." "$target/"
+			printf '%s\n' "$want" > "$stamp"
+			chown -R "$HUB_USER:$HUB_USER" "$target"
+			log "${action}ed baked template '$name' in app/templates"
+			;;
+		skip)
+			log "template '$name' exists and was not installed from the image -- leaving it alone"
+			;;
+	esac
+done
+
 # 4. Database: load schema on an empty database, otherwise apply pending
 #    migrations so a source update never leaves the schema behind.
 db_is_installed || hub-db-init

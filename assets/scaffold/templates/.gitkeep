@@ -1,0 +1,3 @@
+# Project-local templates live here (`cli/autohub template create --name <alias>`).
+# The directory must exist even when empty: the image build COPYs it so cluster
+# deployments carry the template inside the image.

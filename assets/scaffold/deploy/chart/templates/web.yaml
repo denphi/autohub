@@ -60,6 +60,10 @@ spec:
           volumeMounts:
             - { name: src, mountPath: /var/www/html }
             - { name: app, mountPath: /var/www/html/app }
+          # Without an explicit block the namespace LimitRange decides, and a
+          # 32Mi default OOM-kills the PHP cron loop on every tick.
+          resources:
+            {{- toYaml .Values.web.cron.resources | nindent 12 }}
         {{- end }}
       volumes:
         - { name: src, persistentVolumeClaim: { claimName: {{ .Release.Name }}-src } }

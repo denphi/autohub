@@ -6,13 +6,19 @@
 # kubernetes drives kubectl + helm against a cluster (needs deploy/chart/).
 driver: docker
 
-# Only read when driver: kubernetes.
+# Only read when driver: kubernetes. Values may carry inline `# comments`;
+# the loader strips them the way YAML would.
 kubernetes:
   namespace: autohub        # namespace to install into (created if missing)
   release: autohub          # helm release name; prefixes the workloads
   context: ""               # kube context to target ("" = current)
   chart: deploy/chart       # path to the bundled Helm chart
   ingress_host: ""          # external host for `autohub url`/verify (set to your Ingress host)
+  # Helm values overlays, applied in order with -f before the driver's own
+  # --set flags (which therefore still win for .env-derived identity keys).
+  # Comma-separated, relative to the project directory. This is the supported
+  # way to tune chart defaults (resources, storage, ingress) per environment.
+  values_files: ""          # e.g. deploy/prod-values.yaml
 
 # Recurring database backup (kubernetes driver only — renders a CronJob with its
 # own volume). Docker hubs back up on-demand (`autohub db dump`) and before every

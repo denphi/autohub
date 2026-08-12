@@ -98,6 +98,14 @@ COPY docker/apache/hubzero-common.conf /etc/apache2/conf-available/hubzero-commo
 COPY docker/php/hubzero.ini            /usr/local/etc/php/conf.d/zz-hubzero.ini
 COPY docker/bin/                       /usr/local/lib/hubzero/
 
+# Project templates ride inside the image. Locally a template arrives through a
+# compose bind mount, but a cluster has no bind mounts and a ConfigMap cannot
+# carry a template's binary assets past 1MB -- without this, `template create`
+# produces a template the kubernetes driver cannot deploy. The entrypoint
+# installs any template the app/ volume lacks; a live local bind mount, or a
+# template already on the volume, always wins.
+COPY templates/ /usr/local/share/hubzero-templates/
+
 RUN set -eux; \
     a2ensite hubzero; \
     a2enconf hubzero-common; \

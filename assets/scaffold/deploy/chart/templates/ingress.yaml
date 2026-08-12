@@ -28,5 +28,15 @@ spec:
               service:
                 name: {{ .Release.Name }}-web
                 port:
-                  name: https
+                  # http by default: controllers that terminate TLS forward
+                  # plain HTTP, and Apache's :443 answers that with 400.
+                  # Accept a number as well as a name -- rendering `443` as a
+                  # port *name* produces an Ingress the API server rejects on
+                  # IANA_SVC_NAME validation, with no hint about why.
+                  {{- $backend := .Values.ingress.backendPort | default "http" | toString }}
+                  {{- if regexMatch "^[0-9]+$" $backend }}
+                  number: {{ $backend | int }}
+                  {{- else }}
+                  name: {{ $backend | quote }}
+                  {{- end }}
 {{- end }}

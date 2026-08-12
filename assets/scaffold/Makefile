@@ -4,7 +4,7 @@ SHELL := /bin/bash
 COMPOSE     := docker compose
 DEV_COMPOSE := docker compose -f docker-compose.yml -f docker-compose.dev.yml
 
-.PHONY: init help up dev down destroy build logs shell muse update migrate admin backup restore ps status
+.PHONY: init help up dev down destroy build logs shell muse update migrate admin backup restore ps status templates
 
 init: ## Scaffold .env + hub.yml for a new hub (see scripts/hub-init.sh --help)
 	@./scripts/hub-init.sh $(ARGS)
@@ -22,12 +22,18 @@ hub.yml:
 	@printf '# Declarative hub setup. See hub.yml.example for the full reference.\n# An empty manifest does nothing.\n' > hub.yml
 	@echo "Created an empty hub.yml (see hub.yml.example)"
 
-up: .env hub.yml ## Start the production stack (first run installs the hub)
+# The image COPYs this directory so cluster deployments carry their templates.
+# Projects scaffolded before that existed have none, and the build would abort
+# with "COPY failed: file not found in build context".
+templates:
+	@mkdir -p templates
+
+up: .env hub.yml templates ## Start the production stack (first run installs the hub)
 	$(COMPOSE) up -d --build
 	@echo "Site: http://localhost:$${HTTP_PORT:-8080}  (first boot takes a few minutes)"
 	@echo "Follow along with: make logs"
 
-dev: .env hub.yml ## Start the dev stack against the local ./hubzero-cms checkout
+dev: .env hub.yml templates ## Start the dev stack against the local ./hubzero-cms checkout
 	$(DEV_COMPOSE) up -d --build
 	@echo "Site:    http://localhost:$${HTTP_PORT:-8080}"
 	@echo "Adminer: http://localhost:$${ADMINER_PORT:-8081}"
@@ -39,7 +45,7 @@ down: ## Stop everything, keep all data
 destroy: ## Stop everything and delete the source, app data and database
 	$(DEV_COMPOSE) down -v
 
-build: ## Rebuild the runtime image (only needed for PHP/Apache changes)
+build: templates ## Rebuild the runtime image (only needed for PHP/Apache changes)
 	$(COMPOSE) build --pull
 
 logs: ## Follow logs

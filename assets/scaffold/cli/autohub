@@ -87,6 +87,25 @@ def update_env(project_dir, values):
     os.chmod(path, 0o600)
 
 
+def _yaml_scalar(val):
+    """Resolve one scalar value the way YAML would: honor quoting and drop a
+    trailing `# comment`. Taking the raw remainder of the line swallows inline
+    comments — and autohub.yml.example itself uses them, so following the
+    example would corrupt every kubectl/helm invocation built from the value.
+    """
+    val = val.strip()
+    if val.startswith("#"):
+        return ""
+    if val[:1] in ("'", '"'):
+        quote = val[0]
+        end = val.find(quote, 1)
+        if end != -1:
+            return val[1:end]
+        return val[1:]
+    cut = re.search(r"\s#", val)
+    return (val[:cut.start()] if cut else val).strip()
+
+
 def read_autohub_config(project_dir):
     """Parse autohub.yml — the infrastructure manifest (driver selection, k8s
     settings). Absent = docker defaults. A deliberately tiny two-level parser so
@@ -104,7 +123,7 @@ def read_autohub_config(project_dir):
         indented = line[0] in " \t"
         key, _, val = line.strip().partition(":")
         key = key.strip()
-        val = val.strip().strip('"').strip("'")
+        val = _yaml_scalar(val)
         if not indented:
             if val == "":
                 cfg[key] = {}
@@ -155,6 +174,11 @@ class DockerDriver:
                          stdin=stdin, timeout=timeout)
 
     def up(self):
+        # docker/Dockerfile COPYs the project's templates/ into the image so
+        # cluster deployments carry them. A project scaffolded before that
+        # existed has no such directory, and the build would abort with
+        # "COPY failed: file not found in build context".
+        os.makedirs(os.path.join(self.dir, "templates"), exist_ok=True)
         return self._run(self.compose + ["up", "-d", "--build"])
 
     def down(self, volumes=False):
@@ -259,6 +283,12 @@ class KubernetesDriver:
         self.rel = kc.get("release", "autohub")
         self.chart = kc.get("chart", "deploy/chart")
         self.ingress_host = kc.get("ingress_host", "")
+        # Comma-separated Helm values overlays (autohub.yml `values_files:`).
+        # Without this there is no supported way to tune chart defaults per
+        # environment; a hand-written overlay file was silently ignored.
+        self.values_files = [v.strip() for v in
+                             str(kc.get("values_files", "")).split(",")
+                             if v.strip()]
         ctx = kc.get("context", "")
         self.context = ctx
         base = ["kubectl"] + (["--context", ctx] if ctx else [])
@@ -304,8 +334,18 @@ class KubernetesDriver:
         if s.returncode != 0:
             return s
         args = self._helm + ["upgrade", "--install", self.rel,
-            os.path.join(self.dir, self.chart),
-            "--set", "secret.existingSecret=%s-secret" % self.rel]
+            os.path.join(self.dir, self.chart)]
+        # Overlays first: helm gives every --set below precedence over -f, so
+        # an overlay tunes chart defaults while .env-derived identity still
+        # wins. A missing file is an error, not a silent no-op.
+        for values in self.values_files:
+            path = values if os.path.isabs(values) \
+                else os.path.join(self.dir, values)
+            if not os.path.isfile(path):
+                return subprocess.CompletedProcess(["helm"], 1, "",
+                    "values file from autohub.yml does not exist: " + path)
+            args += ["-f", path]
+        args += ["--set", "secret.existingSecret=%s-secret" % self.rel]
         manifest = os.path.join(self.dir, "hub.yml")
         if os.path.isfile(manifest):
             args += ["--set-file", "hubManifest=" + manifest]
@@ -365,6 +405,28 @@ class KubernetesDriver:
             services.append({"service": name, "state": "running" if phase == "Running" else phase,
                              "health": "healthy" if ready else "not-ready"})
         return services
+
+    def pvcs(self):
+        """PVCs labeled with this release. `helm uninstall` never removes
+        them, and after a failed install they keep holding namespace quota —
+        which then fails the retry that was supposed to fix the first
+        attempt. Surfaced by `status` and `down`."""
+        r = self._run(self._kubectl + ["get", "pvc", "-l",
+                      "app.kubernetes.io/instance=" + self.rel, "-o", "json"])
+        found = []
+        try:
+            items = json.loads(r.stdout or "{}").get("items", [])
+        except json.JSONDecodeError:
+            return found
+        for p in items:
+            size = (p.get("status", {}).get("capacity", {}) or {}).get("storage") \
+                or p.get("spec", {}).get("resources", {}).get("requests", {}).get("storage", "?")
+            found.append({
+                "name": p.get("metadata", {}).get("name", ""),
+                "size": size,
+                "phase": p.get("status", {}).get("phase", ""),
+            })
+        return found
 
     def restart(self, service):
         ref, _ = self._ref(service)
@@ -493,6 +555,17 @@ def http_get(url, timeout=20, headers=None):
         return e.code, e.read() if e.fp else b"", dict(e.headers or {})
     except Exception as e:
         return 0, str(e).encode(), {}
+
+
+def _last_stdout_line(result):
+    """Container runtimes can inject banners into exec output (observed:
+    'nvidia driver modules are not yet loaded, invoking runc directly' on
+    every kubectl exec on some clusters). Probes in this file echo their
+    verdict last, so match the final stdout line, never the whole buffer, and
+    never stderr."""
+    lines = [line.strip() for line in (result.stdout or "").splitlines()
+             if line.strip()]
+    return lines[-1] if lines else ""
 
 
 # ---------------------------------------------------------------------------
@@ -874,8 +947,37 @@ def cmd_tls(drv, env, args, res):
     return res
 
 
+def _port_listening(port):
+    """Detect a live listener on the loopback address.
+
+    The bind probe below sets SO_REUSEADDR so a TIME_WAIT socket left by
+    `down` does not fail it, but that also lets a wildcard bind succeed
+    alongside a daemon listening on a specific address (127.0.0.1:8443, say).
+    A short connect settles it: something is accepting connections, so
+    publishing that port would fail later with "port is already allocated".
+    """
+    addresses = [(socket.AF_INET, ("127.0.0.1", int(port)))]
+    if socket.has_ipv6:
+        addresses.append((socket.AF_INET6, ("::1", int(port))))
+    for family, address in addresses:
+        sock = None
+        try:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.settimeout(0.25)
+            if sock.connect_ex(address) == 0:
+                return True
+        except (OSError, TypeError, ValueError):
+            continue
+        finally:
+            if sock is not None:
+                sock.close()
+    return False
+
+
 def _port_available(port):
     """Check wildcard IPv4 and IPv6 binds, matching Docker publication."""
+    if _port_listening(port):
+        return False
     sockets = []
     try:
         families = [(socket.AF_INET, ("0.0.0.0", int(port)))]
@@ -884,7 +986,12 @@ def _port_available(port):
         for family, address in families:
             sock = socket.socket(family, socket.SOCK_STREAM)
             sockets.append(sock)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+            # SO_REUSEADDR=1: a TIME_WAIT socket left behind by `down` must
+            # not fail the probe (an actively listening socket still does).
+            # Windows overloads SO_REUSEADDR to permit binding over a live
+            # listener, so keep the strict probe there.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,
+                            0 if os.name == "nt" else 1)
             if family == socket.AF_INET6:
                 try:
                     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
@@ -975,8 +1082,17 @@ def cmd_up(drv, env, args, res):
     # up() may fail (helm error, bad compose). Surface it — the k8s path in
     # particular returns non-zero without printing to our stream.
     if r is not None and getattr(r, "returncode", 0) != 0:
-        res.fail("start failed: " + scrub(((r.stderr or "") or (r.stdout or "")).strip()
-                                          or "see output above"))
+        output = ((r.stderr or "") or (r.stdout or "")).strip()
+        res.fail("start failed: " + scrub(output or "see output above"))
+        # A release installed before the chart's storage defaults were reduced
+        # cannot converge: PVCs never shrink and volumeClaimTemplates are
+        # immutable. The raw API error names neither cause nor remedy.
+        if re.search(r"persistentvolumeclaim|volumeClaimTemplates|forbidden|"
+                     r"field is immutable|storage.*decrease", output, re.I):
+            res.say("if this release predates the chart's smaller storage "
+                    "defaults, pin the original sizes: set "
+                    "`values_files: deploy/existing-release-storage.yaml` "
+                    "under kubernetes: in autohub.yml, then retry")
         return res
     res.say("stack starting")
     if args.wait:
@@ -1009,6 +1125,12 @@ def cmd_up(drv, env, args, res):
 def cmd_down(drv, env, args, res):
     drv.down(volumes=False)
     res.say("stack stopped (data kept)")
+    retained = drv.pvcs() if hasattr(drv, "pvcs") else []
+    if retained:
+        res.say("PVCs retained and still counting against namespace quota: "
+                + ", ".join("%s (%s)" % (p["name"], p["size"]) for p in retained))
+        res.say("`up` reuses them; `destroy` deletes them — a retry that fails "
+                "on quota is usually blocked by these")
     return res
 
 
@@ -1043,6 +1165,14 @@ def cmd_status(drv, env, args, res):
     services = drv.status()
     if not services:
         res.say("no services running")
+        # A failed or uninstalled release leaves its PVCs bound, silently
+        # consuming quota that the next install then fails against.
+        orphaned = drv.pvcs() if hasattr(drv, "pvcs") else []
+        if orphaned:
+            res.say("orphaned PVCs still hold namespace quota: "
+                    + ", ".join("%s (%s, %s)" % (p["name"], p["size"], p["phase"])
+                                for p in orphaned))
+            res.say("`up` reuses them; `destroy` deletes them")
         res.suggest("cli/autohub up --wait --json")
         return res
     for s in services:
@@ -1053,7 +1183,79 @@ def cmd_status(drv, env, args, res):
     return res
 
 
+# Hash the manifest through the same normalization the Kubernetes path applies
+# to it, on both sides. `--set-file` lands the manifest in a ConfigMap under a
+# `hub.yml: |` block scalar, which clips trailing newlines to exactly one and
+# normalizes CRLF; hashing raw bytes would report a manifest with CRLF endings
+# or no trailing newline as stale forever, and the remedy (`up`) re-renders the
+# identical ConfigMap, so the refusal could never clear. This deliberately does
+# not reuse _sha256, which hashes bytes verbatim for snapshot integrity, where
+# any normalization would be wrong.
+_MANIFEST_DIGEST_SH = (
+    "if [ -f /etc/hubzero/hub.yml ]; then "
+    "printf '%s\\n' \"$(tr -d '\\r' < /etc/hubzero/hub.yml)\" | sha256sum; "
+    "else echo missing; fi")
+
+
+def _normalized_manifest_digest(path):
+    """Digest of a manifest with CR removed and exactly one trailing newline —
+    byte-for-byte what _MANIFEST_DIGEST_SH computes inside the container."""
+    with open(path, "rb") as stream:
+        text = stream.read().decode("utf-8", "replace").replace("\r", "")
+    return hashlib.sha256((text.rstrip("\n") + "\n").encode("utf-8")).hexdigest()
+
+
+def _manifest_stale(drv):
+    """Compare the project hub.yml against what is actually mounted in the web
+    container.
+
+    Both drivers can serve a stale manifest with no error anywhere: Docker
+    Desktop keeps the old inode view of a single-file bind mount after the
+    host file is rewritten (a 70KB manifest read back as 190 bytes, reported
+    as "manifest is empty"), and on Kubernetes the manifest is a ConfigMap
+    captured at the last `up`, so provision re-applies the previous manifest
+    and reports success. Returns (stale, detail); stale is None when there is
+    nothing to compare or the container is unreachable.
+    """
+    host = os.path.join(drv.dir, "hub.yml")
+    if not os.path.isfile(host):
+        return None, "no project hub.yml"
+    digest = _normalized_manifest_digest(host)
+    try:
+        r = drv.exec("web", ["sh", "-c", _MANIFEST_DIGEST_SH])
+    except Exception:
+        return None, "could not reach the web container"
+    reported = _last_stdout_line(r)
+    mounted = reported.split()[0] if reported else ""
+    if r.returncode != 0 or not mounted:
+        return None, "could not read the mounted manifest"
+    if mounted == "missing":
+        return True, "no manifest is mounted at /etc/hubzero/hub.yml"
+    if mounted != digest:
+        return True, "the mounted manifest differs from the project hub.yml"
+    return False, "mounted manifest matches the project hub.yml"
+
+
+def _refuse_stale_manifest(drv, res):
+    """Fail the command when the mounted manifest is stale; True = refused."""
+    stale, detail = _manifest_stale(drv)
+    if not stale:
+        return False
+    if drv.name == "kubernetes":
+        remedy = "run `cli/autohub up` to refresh the manifest ConfigMap and roll the pod"
+        res.suggest("cli/autohub up --wait --json")
+    else:
+        remedy = ("run `cli/autohub down` then `up --wait` to remount it "
+                  "(`up` alone does not refresh a single-file bind mount)")
+        res.suggest("cli/autohub down --json")
+        res.suggest("cli/autohub up --wait --json")
+    res.fail("stale manifest: %s; %s, then re-run this command" % (detail, remedy))
+    return True
+
+
 def cmd_provision(drv, env, args, res):
+    if _refuse_stale_manifest(drv, res):
+        return res
     r = drv.exec("web", ["hub-provision"])
     out = scrub((r.stdout or "") + (r.stderr or ""))
     for line in out.splitlines():
@@ -1271,8 +1473,8 @@ def cmd_verify(drv, env, args, res):
                      "getent hosts \"$HUB_SMTP_HOST\" >/dev/null 2>&1 && "
                      "(exec 3<>/dev/tcp/$HUB_SMTP_HOST/$HUB_SMTP_PORT) 2>/dev/null "
                      "&& echo reachable || echo unreachable"])
-        okmail = "reachable" == (r.stdout or "").strip()
-        res.check("smtp reachable", okmail, (r.stdout or "").strip())
+        okmail = "reachable" == _last_stdout_line(r)
+        res.check("smtp reachable", okmail, _last_stdout_line(r))
         if not okmail:
             res.say("mail failures cause 500s on core actions (group save etc.)")
 
@@ -1291,7 +1493,7 @@ def cmd_verify(drv, env, args, res):
                      "gosu www-data php /usr/local/lib/hubzero/bootstrap-cli.php "
                      ">/dev/null 2>&1 && echo ok || echo fail"])
         res.check("app bootstrap (db reachable, config sane)",
-                  "ok" == (r.stdout or "").strip())
+                  "ok" == _last_stdout_line(r))
 
     return res
 
@@ -1623,6 +1825,16 @@ def cmd_template(drv, env, args, res):
         if not args.name or not re.fullmatch(r"[a-z][a-z0-9_-]*", args.name):
             res.fail("template create requires --name beginning with a lowercase letter")
             return res
+        # `icon-` is claimed by core fontcons: icons.less injects ::before
+        # content into *[class^="icon-"], and template authors conventionally
+        # reuse the template alias as their CSS class prefix. An icon-* alias
+        # therefore inherits invisible pseudo-elements on every custom class,
+        # which presents as broken grids with no error anywhere.
+        if args.name == "icon" or args.name.startswith("icon-"):
+            res.fail("'icon-' is a reserved class prefix (core fontcons matches "
+                     "[class^=\"icon-\"]); choose a template name that does not "
+                     "start with icon-")
+            return res
         target = _create_local_template(drv.dir, args.name)
         res.check("local template created", True, os.path.relpath(target, drv.dir))
         res.say("hub.yml registers and activates %s; .env mounts its project source" % args.name)
@@ -1755,10 +1967,19 @@ def _component_result(drv, domain, operation, args, res, content_root=None,
     try:
         payload = json.loads(raw)
     except (TypeError, ValueError):
-        res.fail("%s adapter returned invalid JSON" % domain)
-        if run.stderr:
-            res.say(scrub(run.stderr).strip())
-        return None
+        # Some container runtimes prepend a banner to every exec's stdout (see
+        # _last_stdout_line). The adapter's JSON object is the payload; retry
+        # from its opening brace before calling the output invalid.
+        brace = raw.find("{")
+        try:
+            payload = json.loads(raw[brace:]) if brace > 0 else None
+        except (TypeError, ValueError):
+            payload = None
+        if payload is None:
+            res.fail("%s adapter returned invalid JSON" % domain)
+            if run.stderr:
+                res.say(scrub(run.stderr).strip())
+            return None
 
     res.data = payload.get("data")
     for detail in payload.get("details", []):
@@ -1873,6 +2094,13 @@ def cmd_component(drv, env, args, res):
     mounted_manifest = os.path.realpath(os.path.join(drv.dir, "hub.yml"))
     if requested_manifest != mounted_manifest:
         res.fail("component commands currently accept the project hub.yml only")
+        return res
+
+    # Every operation here reads the manifest mounted in the container, so a
+    # stale mount would plan, apply, verify, inspect, and export yesterday's
+    # hub.yml while reporting success. `describe` reports live capability and
+    # does not consult the manifest.
+    if operation != "describe" and _refuse_stale_manifest(drv, res):
         return res
 
     if operation == "plan":

@@ -5,13 +5,52 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
+import socket
 import stat
 import subprocess
 import tarfile
 import tempfile
 import unittest
 from unittest import mock
+
+
+def multiline_flow_mappings(text):
+    """1-based line numbers of `{...}` flow mappings that span lines.
+
+    The CMS pins symfony/yaml 3.4, which parses inline collections only when
+    they sit on one line; multi-line support arrived in 4.4. A manifest that
+    trips this fails to parse entirely, so nothing at all is provisioned.
+    """
+    offenders = []
+    block_indent = None
+    depth = 0
+    opened_at = None
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if block_indent is not None:
+            # Inside a block scalar body: braces there are content, not YAML.
+            if stripped and (len(line) - len(line.lstrip())) <= block_indent:
+                block_indent = None
+            else:
+                continue
+        if not stripped or stripped.startswith("#"):
+            continue
+        if re.search(r":\s*[|>][+-]?\d*\s*$", line):
+            block_indent = len(line) - len(line.lstrip())
+            continue
+        code = re.sub(r"\s#.*$", "", line)
+        opens, closes = code.count("{"), code.count("}")
+        if depth == 0 and opens > closes:
+            opened_at = number
+        depth = max(0, depth + opens - closes)
+        if depth == 0 and opened_at is not None:
+            offenders.append(opened_at)      # report where it opened, once
+            opened_at = None
+    if opened_at is not None:
+        offenders.append(opened_at)
+    return offenders
 
 
 def load_autohub():
@@ -176,6 +215,71 @@ class ContentProvisioningTests(unittest.TestCase):
         self.assertIn("articles:\n", manifest)
         self.assertIn("article: home", manifest)
 
+    def test_example_manifest_parses_under_the_pinned_yaml_library(self):
+        # symfony/yaml 3.4 (what hubzero-cms pins) rejects a flow mapping
+        # spanning lines with "Malformed inline YAML string", and provisioning
+        # then applies nothing at all.
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, "hub.yml.example"), encoding="utf-8") as f:
+            manifest = f.read()
+        self.assertEqual(multiline_flow_mappings(manifest), [])
+        self.assertEqual(
+            multiline_flow_mappings("a:\n  - { id: 1,\n      b: 2 }\n"), [2])
+
+    def test_resource_type_default_no_longer_assumes_a_tools_type(self):
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, "docker", "bin", "provision.php"),
+                  encoding="utf-8") as f:
+            provisioner = f.read()
+        # The old implicit default only ever resolved because the example
+        # manifest defined a 'tools' type; it no longer does.
+        self.assertNotIn("$resource['type'] : 'tools'", provisioner)
+        self.assertIn("needs a 'type' naming one of the resource_types aliases",
+                      provisioner)
+
+    def test_params_merge_refuses_to_clobber_non_json_blobs(self):
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, "docker", "bin", "provision.php"),
+                  encoding="utf-8") as f:
+            provisioner = f.read()
+        self.assertIn("function merged_params_json", provisioner)
+        self.assertIn("refusing to replace them", provisioner)
+        # Every merge site goes through the guard rather than array_merge on a
+        # json_decode that returns null for legacy INI Registry data.
+        self.assertNotIn("array_merge((array) json_decode", provisioner)
+        self.assertEqual(provisioner.count("merged_params_json("), 5)
+
+    def test_menu_lookup_matches_rows_in_any_language(self):
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, "docker", "bin", "provision.php"),
+                  encoding="utf-8") as f:
+            provisioner = f.read()
+        # Filtering on language = '*' would miss a localized row and insert a
+        # duplicate-alias sibling with an identical computed path.
+        self.assertNotIn("AND `language` = '*'", provisioner)
+        self.assertIn("ORDER BY (`language` = '*') DESC", provisioner)
+
+    def test_provisioner_guards_learned_from_field_deployment(self):
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, "docker", "bin", "provision.php"),
+                  encoding="utf-8") as f:
+            provisioner = f.read()
+        with open(os.path.join(root, "hub.yml.example"), encoding="utf-8") as f:
+            manifest = f.read()
+
+        # Article aliases must not shadow native component routes.
+        self.assertIn("would shadow the com_", provisioner)
+        # Menu items and resource types accept params: (merged, not replaced).
+        self.assertIn("$item['params']", provisioner)
+        self.assertIn("$type['params']", provisioner)
+        self.assertIn("plg_about", provisioner)
+        # Menu lookups use the database's unique key (no menutype), and a hub
+        # that loses its front page is a hard failure.
+        self.assertIn("no published default (home) menu item", provisioner)
+        # The middleware-backed Tools type renders blank pages on this
+        # scaffold and must not be a recommended default.
+        self.assertNotIn("type: Tools", manifest)
+
     def test_template_pages_are_not_a_manifest_content_pattern(self):
         root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
         with open(os.path.join(root, "hub.yml.example"), encoding="utf-8") as f:
@@ -284,6 +388,170 @@ class ComponentCommandTests(unittest.TestCase):
             self.assertFalse(result.verify_failed)
 
 
+class InfrastructureConfigTests(unittest.TestCase):
+    def test_autohub_config_strips_inline_comments_like_yaml(self):
+        # autohub.yml.example itself uses inline comments; taking the raw
+        # remainder of the line corrupted every kubectl --context invocation.
+        with tempfile.TemporaryDirectory() as project:
+            with open(os.path.join(project, "autohub.yml"), "w",
+                      encoding="utf-8") as stream:
+                stream.write(
+                    "driver: kubernetes   # local default\n"
+                    "kubernetes:          # only read for kubernetes\n"
+                    "  context: geddes    # kube context from iconpcl.yaml\n"
+                    "  release: 'iconpcl' # quoted\n"
+                    "  schedule: \"0 3 * * *\"\n")
+            cfg = autohub.read_autohub_config(project)
+            self.assertEqual(cfg["driver"], "kubernetes")
+            self.assertEqual(cfg["kubernetes"]["context"], "geddes")
+            self.assertEqual(cfg["kubernetes"]["release"], "iconpcl")
+            self.assertEqual(cfg["kubernetes"]["schedule"], "0 3 * * *")
+
+    def test_kubernetes_driver_parses_values_files_list(self):
+        driver = autohub.KubernetesDriver("/tmp/project", {}, {
+            "driver": "kubernetes",
+            "kubernetes": {"values_files": "deploy/a.yaml, deploy/b.yaml"},
+        })
+        self.assertEqual(driver.values_files,
+                         ["deploy/a.yaml", "deploy/b.yaml"])
+
+    def test_exec_probes_match_the_final_stdout_line(self):
+        # Some clusters prepend a runtime banner to every kubectl exec
+        # ("nvidia driver modules are not yet loaded, invoking runc
+        # directly"); the verdict our probes echo is always last.
+        banner = ("nvidia driver modules are not yet loaded, "
+                  "invoking runc directly\nreachable\n")
+        result = subprocess.CompletedProcess(["exec"], 0, banner, "")
+        self.assertEqual(autohub._last_stdout_line(result), "reachable")
+
+        class BannerDriver(FakeDriver):
+            def url(self):
+                return "https://localhost:8443"
+
+            def exec(self, service, command, **_kwargs):
+                return subprocess.CompletedProcess(command, 0, banner, "")
+
+        with tempfile.TemporaryDirectory() as project:
+            args = type("Args", (), {"scope": "mail", "route": []})()
+            res = autohub.Result("verify")
+            autohub.cmd_verify(BannerDriver(project), {}, args, res)
+            self.assertFalse(res.verify_failed)
+
+    def test_manifest_digest_survives_the_configmap_round_trip(self):
+        # helm --set-file lands the manifest in a `hub.yml: |` block scalar,
+        # which clips trailing newlines to one and normalizes CRLF. Hashing
+        # raw bytes would call these manifests stale forever, and the remedy
+        # (`up`) re-renders the identical ConfigMap -- an unclearable refusal.
+        digests = set()
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, "hub.yml")
+            for text in ("a: 1\nb: 2\n", "a: 1\r\nb: 2\r\n",
+                         "a: 1\nb: 2", "a: 1\nb: 2\n\n\n"):
+                with open(path, "w", encoding="utf-8", newline="") as stream:
+                    stream.write(text)
+                digests.add(autohub._normalized_manifest_digest(path))
+        self.assertEqual(len(digests), 1)
+
+    def test_provision_accepts_a_manifest_matching_after_normalization(self):
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, "hub.yml")
+            with open(path, "w", encoding="utf-8", newline="") as stream:
+                stream.write("articles: []")        # no trailing newline
+            digest = autohub._normalized_manifest_digest(path)
+
+            class MatchingDriver(FakeDriver):
+                def exec(self, service, command, **_kwargs):
+                    if command[0] == "sh" and "sha256sum" in command[2]:
+                        return subprocess.CompletedProcess(
+                            command, 0, digest + "  -\n", "")
+                    return subprocess.CompletedProcess(
+                        command, 0,
+                        "[hub] provisioning complete: 3 applied, 0 failed\n", "")
+
+            res = autohub.Result("provision")
+            autohub.cmd_provision(MatchingDriver(project), {}, None, res)
+            self.assertTrue(res.ok, res.details)
+            self.assertFalse(res.verify_failed, res.checks)
+
+    def test_component_result_tolerates_a_runtime_banner_before_json(self):
+        class BannerComponentDriver(FakeDriver):
+            def exec(self, service, command, **_kwargs):
+                payload = json.dumps({"ok": True, "data": {"types": []},
+                                      "checks": [], "errors": []})
+                return subprocess.CompletedProcess(
+                    command, 0,
+                    "nvidia driver modules are not yet loaded, "
+                    "invoking runc directly\n" + payload, "")
+
+        args = type("Args", (), {"max_items": 5, "alias": None, "id": None})()
+        res = autohub.Result("resource")
+        payload = autohub._component_result(
+            BannerComponentDriver("/nonexistent"), "resource", "describe",
+            args, res)
+        self.assertIsNotNone(payload)
+        self.assertTrue(res.ok, res.details)
+
+    def test_stale_manifest_guard_covers_inspect_and_export(self):
+        class StaleComponentDriver(FakeDriver):
+            def exec(self, service, command, **_kwargs):
+                if command[0] == "sh" and "sha256sum" in command[2]:
+                    return subprocess.CompletedProcess(
+                        command, 0, "0" * 64 + "  -\n", "")
+                raise AssertionError(
+                    "must refuse before reading the mounted manifest")
+
+        for operation in ("inspect", "export"):
+            with tempfile.TemporaryDirectory() as project:
+                with open(os.path.join(project, "hub.yml"), "w",
+                          encoding="utf-8") as stream:
+                    stream.write("resources: []\n")
+                args = type("Args", (), {
+                    "cmd": "resource", "sub": operation, "manifest": "hub.yml",
+                    "max_items": 5, "alias": None, "id": None, "authorize": [],
+                })()
+                res = autohub.Result("resource")
+                autohub.cmd_component(
+                    StaleComponentDriver(project), {}, args, res)
+                self.assertFalse(res.ok)
+                self.assertIn("stale manifest", res.details[-1])
+
+    def test_port_preflight_detects_a_listener_the_bind_probe_misses(self):
+        # A daemon on 127.0.0.1 with SO_REUSEADDR: the wildcard bind probe now
+        # succeeds alongside it, so only a connect settles whether publishing
+        # that port would fail later with "port is already allocated".
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server.bind(("127.0.0.1", 0))
+            # Room for several probes: each leaves a connection in the accept
+            # queue that this test never accepts.
+            server.listen(16)
+            port = server.getsockname()[1]
+            self.assertTrue(autohub._port_listening(port))
+            self.assertFalse(autohub._port_available(port))
+        finally:
+            server.close()
+        self.assertFalse(autohub._port_listening(port))
+
+    def test_provision_refuses_a_stale_mounted_manifest(self):
+        class StaleDriver(FakeDriver):
+            def exec(self, service, command, **_kwargs):
+                if command[0] == "sh" and "sha256sum" in command[2]:
+                    return subprocess.CompletedProcess(
+                        command, 0,
+                        "0" * 64 + "  /etc/hubzero/hub.yml\n", "")
+                raise AssertionError("provision must stop on a stale manifest")
+
+        with tempfile.TemporaryDirectory() as project:
+            with open(os.path.join(project, "hub.yml"), "w",
+                      encoding="utf-8") as stream:
+                stream.write("articles: []\n")
+            res = autohub.Result("provision")
+            autohub.cmd_provision(StaleDriver(project), {}, None, res)
+            self.assertFalse(res.ok)
+            self.assertIn("stale manifest", res.details[-1])
+
+
 class InitializationTests(unittest.TestCase):
     def test_init_generates_project_specific_compose_names(self):
         scaffold = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
@@ -358,6 +626,27 @@ class TemplateWorkflowTests(unittest.TestCase):
             self.assertEqual(env["LOCAL_TEMPLATE_PATH"],
                              "./templates/researchhub")
             self.assertEqual(env["LOCAL_TEMPLATE_NAME"], "researchhub")
+
+    def test_template_create_refuses_the_reserved_icon_prefix(self):
+        # Core fontcons injects ::before content into *[class^="icon-"], so an
+        # icon-* template alias (conventionally reused as the CSS class
+        # prefix) inherits invisible pseudo-elements that break grids.
+        for name in ("icon", "icon-pcl"):
+            args = type("Args", (), {
+                "sub": "create", "name": name, "branch": None,
+                "token_env": "GITLAB_TOKEN", "force": False,
+            })()
+            result = autohub.Result("template")
+            autohub.cmd_template(FakeDriver("/nonexistent"), {}, args, result)
+            self.assertFalse(result.ok)
+            self.assertIn("reserved class prefix", result.details[-1])
+
+    def test_starter_layers_on_core_stylesheet(self):
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, "template-starter", "less", "site.less"),
+                  encoding="utf-8") as f:
+            less = f.read()
+        self.assertIn('@import "../../../../core/assets/less/site.less";', less)
 
     def test_template_status_rejects_path_traversal_names(self):
         # A bare "." or ".." must never reach `TEMPLATES_DIR + "/" + name` and

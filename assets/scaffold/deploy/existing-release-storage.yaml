@@ -1,0 +1,23 @@
+# Storage sizes for a release installed before the chart defaults were reduced.
+#
+# Kubernetes never allows a PVC to shrink, and a StatefulSet's
+# volumeClaimTemplates are immutable, so applying the smaller current defaults
+# to an existing release makes `helm upgrade` (and therefore `cli/autohub up`)
+# fail outright. Point autohub.yml at this file to keep the original sizes:
+#
+#   kubernetes:
+#     values_files: deploy/existing-release-storage.yaml
+#
+# New deployments do not need this file — the chart's defaults are sized from a
+# measured running hub and fit a modest namespace quota. Delete it once no
+# release depends on the old sizes.
+
+web:
+  storage:
+    src: { size: 8Gi }
+    app: { size: 8Gi }
+    tls: { size: 16Mi }
+
+db:
+  storage:
+    size: 10Gi

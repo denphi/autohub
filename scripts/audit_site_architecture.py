@@ -9,6 +9,20 @@ import re
 import sys
 
 
+# Routes owned by components HUBzero ships enabled. An article aliased to any
+# of these shadows the component (see the shadowing check below). Derived from
+# core/components/com_*; entries that never resolve as a bare front-end route
+# (cpanel, installer, config, ...) are omitted.
+RESERVED_COMPONENT_ROUTES = frozenset((
+    "activity", "answers", "billboards", "blog", "citations", "collections",
+    "content", "courses", "developer", "events", "feedback", "forum",
+    "groups", "help", "jobs", "kb", "login", "media", "members", "messages",
+    "news", "newsletter", "projects", "publications", "register", "resources",
+    "search", "services", "storefront", "support", "tags", "tools", "usage",
+    "users", "whatsnew", "wiki", "wishlist",
+))
+
+
 def read_text(path):
     try:
         with open(path, encoding="utf-8") as stream:
@@ -55,6 +69,33 @@ def audit(project, require_native_content=False):
             "top-level articles section found" if has_articles
             else "content-rich builds must declare native pages under articles:",
         ))
+
+    # An article alias that matches a native component's route silently shadows
+    # the component: /support serves the article, com_support becomes
+    # unreachable, and the route still returns HTTP 200 so reachability checks
+    # pass. Provisioning rejects an alias matching any enabled component; this
+    # is the pre-provision gate, so keep the list aligned with the components
+    # HUBzero actually ships or the audit passes what provisioning rejects.
+    shadowing = []
+    articles_section = re.search(
+        r"(?ms)^articles:[^\n]*\n(.*?)(?=^[A-Za-z_][A-Za-z0-9_-]*:|\Z)", manifest)
+    if articles_section:
+        body = articles_section.group(1)
+        # Block style (`alias: support`) and flow style
+        # (`- { title: Support, alias: support }`) alike.
+        aliases = re.findall(
+            r"(?m)^\s+alias:\s*[\"']?([A-Za-z0-9_-]+)[\"']?\s*(?:#.*)?$", body)
+        aliases += re.findall(
+            r"[{,]\s*alias\s*:\s*[\"']?([A-Za-z0-9_-]+)[\"']?\s*(?=[,}])", body)
+        shadowing = sorted({alias for alias in aliases
+                            if alias.lower() in RESERVED_COMPONENT_ROUTES})
+    checks.append(check(
+        "no-component-route-shadowing",
+        not shadowing,
+        "no article alias shadows a native component route" if not shadowing
+        else "article alias(es) would shadow native component routes: "
+             + ", ".join(shadowing),
+    ))
 
     resource_pages = bool(
         re.search(
@@ -153,6 +194,28 @@ def audit(project, require_native_content=False):
 
         less_path = os.path.join(template, "less", "site.less")
         less = read_text(less_path)
+
+        # A standalone stylesheet passes every generic-surface grep below by
+        # construction while shipping none of core's .grid/.col.span* system,
+        # #content-header, fontcons, tabs, or tooltips -- every native
+        # component route renders structurally broken with no error. Require
+        # the template to layer on core's stylesheet, or to define the grid
+        # primitives itself.
+        imports_core = bool(re.search(
+            r"""(?m)^\s*@import\s+(?:url\(\s*)?["'][^"']*core/assets/less/site(?:\.less)?["']""",
+            less))
+        defines_grid = all(re.search(pattern, less) for pattern in
+                           (r"\.col\b", r"\bspan\d", r"#content-header\b"))
+        checks.append(check(
+            label + ":core-stylesheet-layering",
+            imports_core or defines_grid,
+            ("site.less layers on core's stylesheet" if imports_core else
+             "site.less defines the grid primitives itself")
+            if imports_core or defines_grid else
+            "site.less neither imports core/assets/less/site.less nor defines "
+            ".col/span*/#content-header; native components will render unstyled",
+        ))
+
         native_surfaces = {
             "form controls": (r"\binput\b", r"\bselect\b", r"\bbutton\b"),
             "tables": (r"\btable\b",),
@@ -191,6 +254,12 @@ def audit(project, require_native_content=False):
     ok = all(item["ok"] for item in checks)
     failed_names = {item["name"] for item in checks if not item["ok"]}
     next_steps = []
+    if any(name.endswith(":core-stylesheet-layering") for name in failed_names):
+        next_steps.append(
+            "Add `@import \"../../../../core/assets/less/site.less\";` so the template layers on core instead of replacing it")
+    if "no-component-route-shadowing" in failed_names:
+        next_steps.append(
+            "Rename article aliases that collide with component routes (support, resources, groups, members, search, login, register, tags)")
     if any(name.endswith(":native-component-styles") for name in failed_names):
         next_steps.append(
             "Add restrained native form, table, filter, result, pagination, empty-state, and responsive styles")

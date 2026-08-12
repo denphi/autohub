@@ -130,6 +130,8 @@ Map common evidence to the smallest relevant action:
 | Required seed is missing | doctor identifies a known seed | run `provision`, then full verification |
 | Changed CSS appears stale | no server error; old browser bytes | clear and warm caches, then hard-reload |
 | Browser reports an untrusted certificate | TLS scope or `tls status` fails | run authorized `tls setup`, recreate the web service, then verify TLS |
+| Provision refuses a stale manifest, or reports "manifest is empty" against a non-empty hub.yml | provision preflight; mounted hub.yml differs from the project file | Docker: `down` then `up --wait` (a single-file bind mount is not remounted by `up` alone); Kubernetes: `up` refreshes the manifest ConfigMap and rolls the pod |
+| A route serves the wrong content but returns 200 | an article alias matches a component route, or a resource uses a middleware `Tools` type | rename the article alias; model the record on a non-middleware resource type |
 
 ## Apply configuration changes
 
@@ -139,6 +141,11 @@ Represent supported additions and parameter changes in `hub.yml`, then run:
 cli/autohub provision --json
 cli/autohub verify --json
 ```
+
+`provision` first proves the manifest mounted in the container matches the
+project `hub.yml` and refuses to run against a stale mount, reporting the
+driver-specific remedy. Follow that remedy rather than editing files inside
+the container.
 
 Provisioning is additive-only. Treat `hub.yml` as authoritative for supported
 configuration that provisioning can apply, not as a convergent inventory of
@@ -220,6 +227,23 @@ files/images, navigation, and relevant owner/editor state render through the
 native component. HTTP success alone is insufficient.
 
 ## Build site content and templates
+
+### Establish the content locale first
+
+Before authoring any prose, determine the language and regional variant the
+hub's text must use — British English, American English, Spanish, and so on.
+Infer it only when the request, the existing manifest, or the hub's stated
+audience makes it unambiguous; otherwise ask the user, offering the plausible
+options for that audience. Ask once, early, rather than per page: the answer
+governs spelling, punctuation, quotation and date conventions, number and
+currency formats, and domain terminology across every article body, menu
+title, template string, alt text, and metadata description.
+
+Apply the chosen variant consistently and do not mix conventions within a hub.
+Record it in the manifest so later sessions inherit it rather than guessing:
+set the hub's configured language, and set `language:` on articles and menu
+items when the hub genuinely serves multiple languages. Aliases and route
+paths stay lowercase ASCII regardless of the content language.
 
 Keep content and presentation separate. Provision ordinary pages, homepage
 copy, policies, news, and learning articles through the `articles:` section of

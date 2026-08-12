@@ -24,6 +24,10 @@ spec:
           ports:
             - { name: smtp, containerPort: 1025 }
             - { name: ui,   containerPort: 8025 }
+          # Explicit resources so the namespace LimitRange default (as low as
+          # 32Mi on some clusters) cannot starve the sink.
+          resources:
+            {{- toYaml .Values.mail.resources | nindent 12 }}
 ---
 apiVersion: v1
 kind: Service
