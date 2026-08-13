@@ -194,6 +194,29 @@ function merge_extension_params($db, array $where, array $params, $label)
 }
 
 /**
+ * A module's manifest entry is either one spec or a list of them.
+ *
+ * The same module can be installed once per client, and both instances may need
+ * declaring: mod_login ships a site instance *and* an administrator one in the
+ * 'login' position, where com_login's backend login view renders every module
+ * it finds next to mod_adminlogin. Declaring only the site instance is the easy
+ * mistake, and it leaves two different sign-in forms on /administrator with no
+ * error anywhere. Since `modules:` is keyed by module name, a single mapping
+ * cannot reach both. A bare mapping still means "just this one".
+ */
+function module_specs($value)
+{
+	if (!is_array($value))
+	{
+		return array();
+	}
+
+	// Spec keys are all strings (position, published, client, params), so a
+	// numeric first key is what distinguishes a list of specs from one spec.
+	return array_key_exists(0, $value) ? $value : array($value);
+}
+
+/**
  * The unconditional seed fixes below repair gaps the CMS installer leaves, so
  * they default ON. `seeds: {name: false}` in the manifest opts one out -- only
  * for a hub that deliberately handles that gap another way.
@@ -482,52 +505,56 @@ if (!empty($manifest['modules']))
 {
 	section('modules');
 
-	foreach ($manifest['modules'] as $module => $spec)
+	foreach ($manifest['modules'] as $module => $entry)
 	{
-		attempt("module {$module}", function () use ($module, $spec, $db)
+		foreach (module_specs($entry) as $spec)
 		{
 			$client = isset($spec['client']) ? (int) $spec['client'] : 0;
 
-			$db->setQuery("SELECT `id`, `params` FROM `#__modules`
-				WHERE `module` = " . $db->quote($module) . "
-				  AND `client_id` = " . $client . "
-				ORDER BY `id` LIMIT 1");
-			$row = $db->loadObject();
-
-			if (!$row)
+			// The client is in the label because one module can now appear twice.
+			attempt("module {$module} (client {$client})", function () use ($module, $spec, $client, $db)
 			{
-				throw new Exception('module is not installed');
-			}
+				$db->setQuery("SELECT `id`, `params` FROM `#__modules`
+					WHERE `module` = " . $db->quote($module) . "
+					  AND `client_id` = " . $client . "
+					ORDER BY `id` LIMIT 1");
+				$row = $db->loadObject();
 
-			$set = array();
+				if (!$row)
+				{
+					throw new Exception('module is not installed');
+				}
 
-			if (isset($spec['position']))
-			{
-				$set[] = '`position` = ' . $db->quote($spec['position']);
-			}
+				$set = array();
 
-			if (isset($spec['published']))
-			{
-				$set[] = '`published` = ' . (int) $spec['published'];
-			}
+				if (isset($spec['position']))
+				{
+					$set[] = '`position` = ' . $db->quote($spec['position']);
+				}
 
-			if (!empty($spec['params']))
-			{
-				$set[] = '`params` = ' . $db->quote(merged_params_json(
-					$row->params, (array) $spec['params'], "module '{$module}'"));
-			}
+				if (isset($spec['published']))
+				{
+					$set[] = '`published` = ' . (int) $spec['published'];
+				}
 
-			if (!$set)
-			{
-				return false;
-			}
+				if (!empty($spec['params']))
+				{
+					$set[] = '`params` = ' . $db->quote(merged_params_json(
+						$row->params, (array) $spec['params'], "module '{$module}'"));
+				}
 
-			$db->setQuery("UPDATE `#__modules` SET " . implode(', ', $set)
-				. " WHERE `id` = " . (int) $row->id);
-			$db->query();
+				if (!$set)
+				{
+					return false;
+				}
 
-			return true;
-		});
+				$db->setQuery("UPDATE `#__modules` SET " . implode(', ', $set)
+					. " WHERE `id` = " . (int) $row->id);
+				$db->query();
+
+				return true;
+			});
+		}
 	}
 }
 

@@ -268,6 +268,15 @@ users:
 # Position matters more than it looks: a module in a position the active
 # template does not render is invisible, with no error anywhere. mod_menu ships
 # in Joomla's "position-7", which most HUBzero templates never output.
+#
+# An entry is one mapping, or a LIST of mappings when the same module is
+# installed for more than one client (`client: 0` site, `client: 1`
+# administrator; 0 is the default, so a bare mapping only ever reaches the site
+# instance). mod_login is the case that bites: com_login's backend login view
+# renders every module in the administrator's `login` position alongside
+# mod_adminlogin, so leaving the client-1 instance published puts two different
+# sign-in forms on /administrator ("User Name" and "Email address or username").
+# They post to the same endpoint, so nothing errors -- it just reads as broken.
 modules:
   mod_menu:
     position: user3          # where THIS template renders its main nav
@@ -275,7 +284,9 @@ modules:
       showAllChildren: 1     # without this, sub-items never render -> no dropdowns
       endLevel: 0            # 0 = all levels
   mod_login:
-    published: 0             # this template hardcodes login into its aux nav
+    - published: 0           # this template hardcodes login into its aux nav
+    - client: 1
+      published: 0           # mod_adminlogin is the backend's own form
 
 # --- Menus ------------------------------------------------------------------
 # Either a bare list of items, or a map with `items:` and options.
