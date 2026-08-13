@@ -54,10 +54,21 @@ for baked in /usr/local/share/hubzero-templates/*/; do
 	stamp="$target/.autohub-baked"
 	want=$(find "$baked" -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1)
 
-	if [ ! -d "$target" ] || [ -z "$(ls -A "$target" 2>/dev/null)" ]; then
+	if mountpoint -q -- "$target" 2>/dev/null \
+		|| awk -v t="$target" '$2 == t { found = 1 } END { exit !found }' /proc/self/mounts 2>/dev/null; then
+		# A developer's working copy, bind-mounted over this path. Being a
+		# mountpoint is the one signal a bind mount cannot fake, and it holds
+		# even when the mounted directory is empty.
+		#
+		# Compare the mount point as a FIELD, never as a grep pattern:
+		# /proc/self/mounts octal-escapes whitespace (a space becomes \040),
+		# and a path used as a regex would silently fail to match -- falling
+		# through to the refresh branch, which deletes the developer's files.
+		action=mounted
+	elif [ ! -d "$target" ] || [ -z "$(ls -A "$target" 2>/dev/null)" ]; then
 		action=install
 	elif [ ! -f "$stamp" ]; then
-		action=skip           # not ours: bind mount or operator-managed
+		action=skip           # present but not installed from an image
 	elif [ "$(cat "$stamp" 2>/dev/null)" = "$want" ]; then
 		action=current
 	else
@@ -74,6 +85,9 @@ for baked in /usr/local/share/hubzero-templates/*/; do
 			printf '%s\n' "$want" > "$stamp"
 			chown -R "$HUB_USER:$HUB_USER" "$target"
 			log "${action}ed baked template '$name' in app/templates"
+			;;
+		mounted)
+			log "template '$name' is a bind mount -- leaving the working copy alone"
 			;;
 		skip)
 			log "template '$name' exists and was not installed from the image -- leaving it alone"

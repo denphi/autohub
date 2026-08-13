@@ -2,6 +2,14 @@
 defined('_HZEXEC_') or die();
 
 $stylesheet = \Hubzero\Document\Assets::getSystemStylesheet();
+
+// Same component hooks as index.php: core's CSS is scoped under the component
+// name and #content, and the reduced view needs them just as much.
+$option = Request::getCmd('option', '');
+$esc = function ($value)
+{
+	return htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
+};
 ?>
 <!doctype html>
 <html dir="<?php echo $this->direction; ?>" lang="<?php echo $this->language; ?>">
@@ -13,8 +21,8 @@ $stylesheet = \Hubzero\Document\Assets::getSystemStylesheet();
 		<?php endif; ?>
 		<jdoc:include type="head" />
 	</head>
-	<body class="ah-component-view">
-		<main class="ah-shell">
+	<body class="ah-component-view <?php echo $esc($option); ?>">
+		<main id="content" class="ah-shell <?php echo $esc($option); ?>">
 			<jdoc:include type="message" />
 			<jdoc:include type="component" />
 		</main>

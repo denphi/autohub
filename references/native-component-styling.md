@@ -47,6 +47,47 @@ variables are camelCase and do not collide with a template's own tokens, so the
 import is safe. The architecture audit fails a template whose stylesheet
 neither imports core nor defines the grid primitives itself.
 
+**The shell must emit the component name and `#content`.** Core scopes a large
+share of its component CSS under both:
+
+```css
+.com_resources .resource-type { ... }
+#content.com_members { ... }
+```
+
+Core's own templates supply them, so a shell that omits either makes those
+rules match nothing, on every component route, in every hub built from that
+template — which reads as "core's CSS is ugly" rather than "core's CSS never
+applied". Emit both in `index.php` and `component.php`:
+
+```php
+$option = Request::getCmd('option', '');
+...
+<body class="ah-site <?php echo $esc($option); ?>">
+<main id="content" class="ah-main <?php echo $esc($option); ?>" tabindex="-1">
+```
+
+The skip link and any `#main-content` selectors move with it.
+
+**Restyle core's shared container primitives first.** `com_kb`, `com_groups`,
+`com_support` and `com_answers` build their pages from blocks core paints:
+
+| Selector | Core value |
+|---|---|
+| `.container`, `.container-block` | `#ececec` |
+| `.data-entry` | `#666` |
+| `.subject .container h3`, `.container-block h3` | a 30px diagonal hatch |
+
+On a modern template these read as broken rather than plain — flat grey slabs,
+a dark grey search bar, candy-stripes across every block heading. Restyling
+these five selectors once fixes every component that uses them, so do it before
+chasing any single component's appearance.
+
+Write them as rules, not variable redefinitions. LesserPHP evaluates in source
+order: a redefinition placed *after* the core import never reaches rules core
+has already compiled, and one placed *before* it is overwritten by core's own
+`variables.less`.
+
 **`icon-` is a reserved class prefix.** Core's `icons.less` injects fontcons
 pseudo-elements into every element matching `*[class^="icon-"]` or
 `*[class*=" icon-"]`. A layout class such as `.icon-card` or `.icon-hero`

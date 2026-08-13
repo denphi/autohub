@@ -19,6 +19,10 @@ kubernetes:
   # Comma-separated, relative to the project directory. This is the supported
   # way to tune chart defaults (resources, storage, ingress) per environment.
   values_files: ""          # e.g. deploy/prod-values.yaml
+  # How long `up` waits for the release to become ready. First boot clones the
+  # CMS, installs dependencies and loads the schema, all CPU-bound, so on a
+  # small namespace it can take far longer than helm's own 5m default.
+  timeout: 40m
 
 # Recurring database backup (kubernetes driver only — renders a CronJob with its
 # own volume). Docker hubs back up on-demand (`autohub db dump`) and before every

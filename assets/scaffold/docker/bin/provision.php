@@ -1062,6 +1062,296 @@ if (!empty($manifest['articles']))
 }
 
 // ---------------------------------------------------------------------------
+// Knowledge base (com_kb)
+// ---------------------------------------------------------------------------
+// com_kb is installed and enabled in a stock hub, but nothing in the manifest
+// could populate it -- so a question-and-answer archive had to become an
+// article full of <details> accordions, losing search, per-article routes,
+// categories and voting.
+//
+// Three things make it easy to get wrong, and all three fail silently:
+//   - categories are a nested set in #__categories scoped by
+//     `extension = 'com_kb'`, so inserting one needs the same lft/rgt splice
+//     as a menu item;
+//   - #__kb_articles.category is validated 'positive|nonzero', so an article
+//     without a real category is unreachable;
+//   - both tables are filtered through User::getAuthorisedViewLevels(), and
+//     #__kb_articles.access DEFAULTS TO 0, which matches no view level -- the
+//     natural insert produces records that exist and nobody can see.
+if (!empty($manifest['kb']))
+{
+	section('kb');
+
+	// com_kb's category index is not generic about the tree: archive.php does
+	// `whereEquals('parent_id', 1)`, so a kb category parented anywhere else
+	// simply does not list on /kb -- no error, and per-article routes still
+	// resolve, which makes it look like a content problem. HUBzero's installer
+	// seeds ROOT at exactly id 1 (core/bootstrap/Install/sql/mysql/data.sql),
+	// so id 1 is the only correct parent here.
+	$kbRoot = 1;
+
+	$db->setQuery("SELECT `level` FROM `#__categories` WHERE `id` = 1");
+	$kbRootLevel = $db->loadResult();
+
+	if ($kbRootLevel === null)
+	{
+		$db->setQuery("SELECT COUNT(*) FROM `#__categories`
+			WHERE `parent_id` = 0 AND `level` = 0");
+
+		if ((int) $db->loadResult())
+		{
+			// A root exists somewhere else. Creating a second one, or hanging
+			// categories off it, both produce a silently empty /kb.
+			$failed++;
+			fwrite(STDERR, "[hub]   FAILED kb: the category ROOT is not id 1, but com_kb"
+				. " lists only categories whose parent_id is 1; repair #__categories first\n");
+			$kbRoot = 0;
+		}
+		else
+		{
+			$db->setQuery("INSERT INTO `#__categories` SET `id` = 1,
+				`parent_id` = 0, `lft` = 0, `rgt` = 1, `level` = 0, `path` = '',
+				`extension` = 'system', `title` = 'ROOT', `alias` = 'root',
+				`note` = '', `description` = '', `published` = 1, `access` = 1,
+				`params` = '{}', `metadesc` = '', `metakey` = '', `metadata` = '',
+				`language` = '*'");
+			$db->query();
+		}
+	}
+
+	$kbCategories = array();
+
+	foreach ((array) ($kbRoot && isset($manifest['kb']['categories'])
+		? $manifest['kb']['categories'] : array()) as $spec)
+	{
+		$title = (isset($spec['title']) && is_scalar($spec['title']))
+			? trim((string) $spec['title']) : '';
+		$alias = (isset($spec['alias']) && is_scalar($spec['alias']))
+			? trim((string) $spec['alias'])
+			: trim(strtolower(preg_replace('/[^a-z0-9]+/i', '-', $title)), '-');
+
+		if (!$title || !$alias)
+		{
+			$failed++;
+			fwrite(STDERR, "[hub]   FAILED kb category: needs a scalar 'title' and an 'alias'\n");
+			continue;
+		}
+
+		attempt("kb category {$alias}", function () use ($spec, $title, $alias, $kbRoot, $db, &$kbCategories)
+		{
+			$db->setQuery("SELECT `id` FROM `#__categories`
+				WHERE `extension` = 'com_kb' AND `alias` = " . $db->quote($alias) . " LIMIT 1");
+			$existing = (int) $db->loadResult();
+
+			$description = isset($spec['description']) ? $spec['description'] : '';
+
+			// Validate BEFORE touching the tree. #__categories is MyISAM, so
+			// the lft/rgt shift below cannot be rolled back -- anything that
+			// throws between the shift and the insert leaves a permanent hole
+			// that widens on every re-run.
+			if (!is_scalar($description))
+			{
+				throw new Exception("'description' must be text, not a list or map");
+			}
+
+			if (strlen($title) > 255 || strlen($alias) > 255)
+			{
+				throw new Exception("'title' and 'alias' are limited to 255 characters");
+			}
+
+			$fields = array(
+				'extension'   => 'com_kb',
+				'title'       => $title,
+				'alias'       => $alias,
+				'description' => (string) $description,
+				'published'   => isset($spec['published']) ? (int) $spec['published'] : 1,
+				// access 1 = Public. The column defaults to 0, which no view
+				// level matches, so the category would never list.
+				'access'      => isset($spec['access']) ? (int) $spec['access'] : 1,
+				'language'    => '*',
+			);
+
+			$set = array();
+
+			foreach ($fields as $column => $value)
+			{
+				$set[] = '`' . $column . '` = ' . $db->quote($value);
+			}
+
+			if ($existing)
+			{
+				$db->setQuery("UPDATE `#__categories` SET " . implode(', ', $set)
+					. " WHERE `id` = " . $existing);
+				$db->query();
+
+				$kbCategories[$alias] = $existing;
+
+				return true;
+			}
+
+			// Splice in as the last child of ROOT: take the parent's right
+			// edge, shift everything at or beyond it, occupy the gap. Same
+			// nested-set dance as menuItem().
+			$db->setQuery("SELECT `rgt` FROM `#__categories` WHERE `id` = " . (int) $kbRoot);
+			$edge = (int) $db->loadResult();
+
+			$set[] = '`parent_id` = ' . (int) $kbRoot;
+			$set[] = '`level` = 1';
+			$set[] = '`path` = ' . $db->quote($alias);
+			$set[] = '`lft` = ' . $edge;
+			$set[] = '`rgt` = ' . ($edge + 1);
+			$set[] = '`params` = ' . $db->quote('{}');
+			// These columns are NOT NULL with no usable default.
+			$set[] = "`note` = ''";
+			$set[] = "`metadesc` = ''";
+			$set[] = "`metakey` = ''";
+			$set[] = "`metadata` = ''";
+			$set[] = '`created_time` = ' . $db->quote(gmdate('Y-m-d H:i:s'));
+
+			$db->setQuery("UPDATE `#__categories` SET `rgt` = `rgt` + 2 WHERE `rgt` >= " . $edge);
+			$db->query();
+			$db->setQuery("UPDATE `#__categories` SET `lft` = `lft` + 2 WHERE `lft` > " . $edge);
+			$db->query();
+
+			try
+			{
+				$db->setQuery("INSERT INTO `#__categories` SET " . implode(', ', $set));
+				$db->query();
+			}
+			catch (Throwable $e)
+			{
+				// No transactions on MyISAM: close the gap by hand so a failed
+				// entry does not leave the tree permanently wrong.
+				$db->setQuery("UPDATE `#__categories` SET `lft` = `lft` - 2 WHERE `lft` > " . $edge);
+				$db->query();
+				$db->setQuery("UPDATE `#__categories` SET `rgt` = `rgt` - 2 WHERE `rgt` >= " . $edge);
+				$db->query();
+
+				throw $e;
+			}
+
+			$kbCategories[$alias] = (int) $db->insertid();
+
+			return true;
+		});
+	}
+
+	// With no usable ROOT no kb category can be listed, so every article would
+	// fail on a missing category anyway; one clear error beats a cascade.
+	foreach ((array) ($kbRoot && isset($manifest['kb']['articles'])
+		? $manifest['kb']['articles'] : array()) as $spec)
+	{
+		$title = (isset($spec['title']) && is_scalar($spec['title']))
+			? trim((string) $spec['title']) : '';
+		$alias = (isset($spec['alias']) && is_scalar($spec['alias']))
+			? trim((string) $spec['alias'])
+			: trim(strtolower(preg_replace('/[^a-z0-9]+/i', '-', $title)), '-');
+
+		if (!$title || !$alias)
+		{
+			$failed++;
+			fwrite(STDERR, "[hub]   FAILED kb article: needs a scalar 'title' and an 'alias'\n");
+			continue;
+		}
+
+		attempt("kb article {$alias}", function () use ($spec, $title, $alias, $db, $kbCategories)
+		{
+			$categoryAlias = isset($spec['category']) ? trim((string) $spec['category']) : '';
+			$categoryId = 0;
+
+			if ($categoryAlias !== '')
+			{
+				if (isset($kbCategories[$categoryAlias]))
+				{
+					$categoryId = (int) $kbCategories[$categoryAlias];
+				}
+				else
+				{
+					$db->setQuery("SELECT `id` FROM `#__categories`
+						WHERE `extension` = 'com_kb'
+						  AND `alias` = " . $db->quote($categoryAlias) . " LIMIT 1");
+					$categoryId = (int) $db->loadResult();
+				}
+			}
+
+			if (!$categoryId)
+			{
+				throw new Exception("needs a 'category' naming a declared or existing kb"
+					. " category; #__kb_articles.category is validated positive|nonzero"
+					. " and a zero category is unreachable");
+			}
+
+			// Identity is (category, alias), not alias: com_kb resolves an
+			// article with whereEquals('alias') AND whereEquals('category'),
+			// so the same alias may legitimately exist in two categories.
+			// Matching on alias alone would collapse them into one row and
+			// silently move a hand-authored article to another category.
+			$db->setQuery("SELECT `id` FROM `#__kb_articles`
+				WHERE `alias` = " . $db->quote($alias) . "
+				  AND `category` = " . (int) $categoryId . " LIMIT 1");
+			$existing = (int) $db->loadResult();
+
+			$params = isset($spec['params']) ? $spec['params'] : array();
+
+			if (is_array($params))
+			{
+				$params = json_encode($params);
+			}
+
+			$fulltxt = array_key_exists('content', $spec)
+				? $spec['content']
+				: (isset($spec['fulltxt']) ? $spec['fulltxt'] : '');
+
+			// The model validates fulltxt as 'notempty'. Writing an empty body
+			// through raw SQL bypasses that, and the resulting article renders
+			// as a bare title that the administrator UI then refuses to save --
+			// repairable only with SQL.
+			if (!is_scalar($fulltxt) || trim((string) $fulltxt) === '')
+			{
+				throw new Exception("needs non-empty 'content'; com_kb validates"
+					. " fulltxt as notempty and an empty body cannot be fixed in the admin UI");
+			}
+
+			$fields = array(
+				'title'    => $title,
+				'alias'    => $alias,
+				'fulltxt'  => (string) $fulltxt,
+				'category' => $categoryId,
+				'state'    => isset($spec['state']) ? (int) $spec['state']
+					: (isset($spec['published']) ? (int) $spec['published'] : 1),
+				// access defaults to 0 in the schema, which lists to nobody.
+				'access'   => isset($spec['access']) ? (int) $spec['access'] : 1,
+				'params'   => (string) $params,
+			);
+
+			$set = array();
+
+			foreach ($fields as $column => $value)
+			{
+				$set[] = '`' . $column . '` = ' . $db->quote($value);
+			}
+
+			if ($existing)
+			{
+				$set[] = '`modified` = ' . $db->quote(gmdate('Y-m-d H:i:s'));
+				$db->setQuery("UPDATE `#__kb_articles` SET " . implode(', ', $set)
+					. " WHERE `id` = " . $existing);
+			}
+			else
+			{
+				$set[] = '`created` = ' . $db->quote(gmdate('Y-m-d H:i:s'));
+				$set[] = '`created_by` = ' . (isset($spec['created_by']) ? (int) $spec['created_by'] : 0);
+				$db->setQuery("INSERT INTO `#__kb_articles` SET " . implode(', ', $set));
+			}
+
+			$db->query();
+
+			return true;
+		});
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Users
 // ---------------------------------------------------------------------------
 if (!empty($manifest['users']))

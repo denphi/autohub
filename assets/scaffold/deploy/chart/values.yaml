@@ -56,11 +56,16 @@ hubManifest: |
   # site: My Hub
 
 # Defaults are sized from a measured running hub (hub_src ~1.1Gi, hub_app a few
-# Mi + uploads, database ~155Mi) so they fit a modest namespace quota. With
-# everything below enabled the chart asks for ~8Gi of requests.storage and
-# ~3.75 CPU / ~3.4Gi memory of limits (+10Gi storage if backup.enabled). Tune
-# per environment with `values_files:` in autohub.yml, never by editing the
-# chart in place.
+# Mi + uploads, database ~155Mi) so they fit a real, modest namespace quota.
+# With everything below enabled the chart asks for 8256Mi of requests.storage
+# (src 3Gi + app 2Gi + tls 64Mi + db 3Gi; +10Gi if backup.enabled) and
+# 1.7 CPU / ~4.6Gi of limits: web 1/3Gi, cron 200m/512Mi, db 400m/1Gi, mail
+# 100m/128Mi. CPU is the binding constraint in practice -- a Geddes namespace
+# granted 10000Mi of storage and 8Gi of memory but still only **2 CPU**, which
+# a 4-CPU chart exceeds on that axis alone.
+#
+# Tune per environment with `values_files:` in autohub.yml, never by editing
+# the chart in place.
 #
 # UPGRADING an existing release: these storage sizes are SMALLER than the
 # chart's earlier defaults. Kubernetes never shrinks a PVC and a StatefulSet's
@@ -79,10 +84,10 @@ web:
     # cron loop on every tick.
     resources:
       requests: { cpu: "50m",  memory: "128Mi" }
-      limits:   { cpu: "500m", memory: "256Mi" }
+      limits:   { cpu: "200m", memory: "512Mi" }
   resources:
     requests: { cpu: "250m", memory: "768Mi" }
-    limits:   { cpu: "2",    memory: "2Gi" }
+    limits:   { cpu: "1",    memory: "3Gi" }
   storage:
     src: { size: 3Gi }    # the CMS checkout (hub_src; ~1.1Gi measured)
     app: { size: 2Gi }    # config, uploads, logs, cache, sessions (hub_app)
@@ -96,7 +101,7 @@ db:
     storageClassName: ""
   resources:
     requests: { cpu: "250m", memory: "512Mi" }
-    limits:   { cpu: "1",    memory: "1Gi" }
+    limits:   { cpu: "400m", memory: "1Gi" }
 
 mail:
   enabled: true           # in-cluster mailpit sink (compose parity)
@@ -104,7 +109,7 @@ mail:
   # Explicit resources for the same LimitRange reason as web.cron above.
   resources:
     requests: { cpu: "25m",  memory: "64Mi" }
-    limits:   { cpu: "250m", memory: "128Mi" }
+    limits:   { cpu: "100m", memory: "128Mi" }
 
 # Recurring database backup (CronJob). hub-backup dumps over the network, so
 # this needs only DB access + its own volume — no conflict with the web pod's
@@ -116,6 +121,13 @@ backup:
   storage:
     size: 10Gi
     storageClassName: ""
+  # Explicit resources for the same LimitRange reason as web.cron and mail: a
+  # mysqldump piped through gzip at a 32Mi namespace default is OOM-killed
+  # every night, and on a quota that requires limits the pod fails admission
+  # so no backup is ever taken.
+  resources:
+    requests: { cpu: "50m",  memory: "128Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
 
 service:
   type: ClusterIP

@@ -226,6 +226,7 @@ projects:  [...]                  # native team workspaces
 resources: [...]                  # datasets, tools, and downloads
 publications: [...]               # native versioned research outputs
 courses:   [...]                  # course/unit/asset hierarchies
+kb:        { categories: [...], articles: [...] }   # com_kb Q&A / FAQ archive
 users:     [...]                  # extra accounts (admin comes from .env)
 groups:    [...]
 menus:     { site: [...] }        # including which item is the front page
@@ -458,8 +459,14 @@ handler logs the warning to `app/logs` *before* deciding whether to die.
   lacks and refreshes one it installed earlier when the image's copy has
   changed, tracked by a `.autohub-baked` content stamp inside the template
   directory. A template directory without that stamp was put there by
-  something else — a live local bind mount, an operator, a `hub.yml` extension
-  clone — and is never overwritten; the boot log says so explicitly.
+  something else — an operator, a `hub.yml` extension clone — and is never
+  overwritten; the boot log says so explicitly. A developer's working copy is
+  detected separately, by being a mountpoint in `/proc/self/mounts`, which is
+  the one signal a bind mount cannot fake and which holds even when the
+  mounted directory is empty. Installing only when the directory is *absent*
+  is not sufficient: on a cluster it exists from the first boot, so every
+  later image would ship template changes that never reach the running site —
+  which looks exactly like a cache problem and is not.
 - **`templates/` must exist for the image to build.** `cli/autohub up` and the
   Makefile create it, so a project scaffolded before templates were baked in
   keeps building; a hand-rolled `docker build` in such a project needs
@@ -474,6 +481,12 @@ handler logs the warning to `app/logs` *before* deciding whether to die.
   resources — on a real cluster "no limits" means "whatever the namespace
   LimitRange says", which has been observed as 32Mi and an OOM-killed cron
   loop.
+- **First boot is CPU-bound and the defaults are deliberately small**, so `up`
+  waits 40 minutes by default (`kubernetes.timeout` in `autohub.yml`). A
+  namespace capped at 2 CPU will take much longer than a laptop to clone the
+  CMS, install dependencies and load the schema; a timeout that fires reports
+  a failed release for a cluster that is merely slow, and leaves PVCs holding
+  quota that then fails the retry.
 - **Upgrading a release installed with the older, larger storage defaults
   requires pinning them.** Kubernetes never shrinks a PVC, and a StatefulSet's
   `volumeClaimTemplates` are immutable, so `helm upgrade` refuses the smaller
@@ -492,6 +505,12 @@ handler logs the warning to `app/logs` *before* deciding whether to die.
   `nginx.ingress.kubernetes.io/force-ssl-redirect: "true"` — HUBzero's own
   `force_ssl` covers parts of the admin flow, not the site, so HTTPS is
   enforced at the controller.
+- **The driver manages `<release>-secret` itself**, applying it from `.env` on
+  every `up` (via stdin, so values never reach argv) and passing
+  `--set secret.existingSecret=<release>-secret`. Do not create that Secret by
+  hand: the chart's `secret.existingSecret` value exists only for a deployment
+  that does not use this driver, and following it otherwise leaves a second,
+  unused Secret sitting beside the real one.
 - **`helm uninstall` and `down` never delete PVCs.** After a failed install
   they keep holding quota, which then fails the retry. `status` and `down`
   list them; `destroy` (with its confirmation guards) removes them.

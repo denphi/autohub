@@ -27,6 +27,7 @@ Classify every requested page or record before writing code.
 | Versioned publication or image publication | `com_publications` | `projects:` and `publications:` |
 | Course, unit, or learning asset | `com_courses` | `courses:` |
 | Research team workspace | `com_projects` | `projects:` |
+| Question-and-answer archive, FAQ, help article | `com_kb` | `kb:` |
 | Research community | `com_groups` | `groups:` |
 | User/account | `com_members` / `com_users` | component configuration and `users:` |
 | Primary navigation and route aliases | `com_menus` | `menus:` |
@@ -35,6 +36,14 @@ Classify every requested page or record before writing code.
 Do not invent a `Pages` resource type for ordinary site pages. A resource is a
 catalogued research object with resource behavior; it is not a substitute for
 an editable article.
+
+Likewise, do not build an FAQ as one article full of `<details>` accordions.
+`com_kb` is installed and enabled in a stock hub and owns exactly that shape,
+giving search, per-article routes (`/kb/<category>/<alias>`), categories, and
+helpful/not-helpful voting that an accordion throws away. Declare it under
+`kb:` with `categories:` and `articles:`; each article needs a `category`,
+because a zero category is unreachable, and provisioning sets `access: 1` by
+default since the underlying column defaults to a level no one can see.
 
 Use an installed domain component when it owns the concept. For example, use
 native groups rather than writing group cards that merely look interactive.
@@ -190,6 +199,20 @@ without replacing ownership of the underlying records.
 Render primary navigation from the configured menu module. Do not hard-code a
 second navigation list in `index.php`. Render login/account state from a module
 or shared template chrome, not from page-specific content files.
+
+**Ship a sign-out affordance.** A template with a sign-in link and no way back
+out strands every authenticated user, and the bug report is simply "I cannot
+log out". Immediate logout carries the session form token; the tokenless
+`com_users&view=logout` route only reaches a confirmation view:
+
+```php
+Route::url('index.php?option=com_login&task=logout&' . Session::getFormToken() . '=1');
+```
+
+Put it in the header chrome behind `User::isGuest()`, alongside the account
+name. Note that `system/incomplete`, if enabled without a real profile policy,
+intercepts navigation *including this route* until the user fills in Residency,
+Citizenship and Racial Background — which presents as the same bug.
 
 Load assets through the document asset API and derive template image/script
 paths from the CMS base URL and active template name. Do not hard-code

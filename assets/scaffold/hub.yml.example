@@ -38,9 +38,15 @@ template:
 plugins:
   enable:
     - user/hubzero
-    - system/incomplete
   disable:
     - user/constantcontact
+    # system/incomplete forces every logged-in user through a "complete your
+    # profile" interstitial on EVERY request until Residency, Citizenship and
+    # Racial Background are filled in. It intercepts navigation including the
+    # route to sign out, so a user who declines cannot even leave -- the
+    # reported symptom is "I cannot log out". Enable it only behind a real
+    # profile policy that your hub actually requires.
+    - system/incomplete
     # For a local demonstration only, disabling system/userconsent prevents its
     # anonymous consent screen from replacing the administrator login form.
     # Production hubs should configure their required consent policy instead.
@@ -158,6 +164,27 @@ articles:
     content: |
       <h1>About this hub</h1>
       <p>Describe the hub's mission, community, and governance here.</p>
+
+# --- Knowledge base (com_kb) ------------------------------------------------
+# A question-and-answer archive belongs in com_kb, which is installed and
+# enabled in a stock hub. Use it instead of an article full of <details>
+# accordions: com_kb gives search, per-article routes (/kb/<category>/<alias>),
+# categories and helpful/not-helpful voting.
+#
+# Categories are a nested set in #__categories; articles need a real category (a zero
+# category is unreachable) and access: 1 to be visible at all -- the underlying
+# column defaults to 0, which matches no view level. Provisioning handles both.
+# kb:
+#   categories:
+#     - alias: getting-started
+#       title: Getting Started
+#       description: Common questions from new members.
+#   articles:
+#     - alias: how-do-i-request-an-account
+#       title: How do I request an account?
+#       category: getting-started
+#       content: |
+#         <p>Describe the account request process here.</p>
 
 # Datasets, downloads, publications, and other catalogued research objects
 # belong in com_resources. New manifests should use a stable alias; title

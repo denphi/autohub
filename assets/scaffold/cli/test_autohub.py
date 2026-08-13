@@ -259,6 +259,40 @@ class ContentProvisioningTests(unittest.TestCase):
         self.assertNotIn("AND `language` = '*'", provisioner)
         self.assertIn("ORDER BY (`language` = '*') DESC", provisioner)
 
+    def test_knowledge_base_is_provisionable(self):
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, "docker", "bin", "provision.php"),
+                  encoding="utf-8") as f:
+            provisioner = f.read()
+        self.assertIn("$manifest['kb']", provisioner)
+        self.assertIn("INSERT INTO `#__kb_articles`", provisioner)
+        # extension-scoped nested set, non-zero category, and a visible access
+        # level -- the three ways a kb record silently fails to appear.
+        self.assertIn("`extension` = 'com_kb'", provisioner)
+        self.assertIn("positive|nonzero", provisioner)
+        # access must default to a level that is actually visible; the column
+        # defaults to 0, which matches no view level.
+        self.assertRegex(
+            provisioner,
+            r"'access'\s*=>\s*isset\(\$spec\['access'\]\)[^\n]*:\s*1")
+        # Identity is (category, alias): com_kb resolves an article by both.
+        self.assertRegex(
+            provisioner,
+            r"FROM `#__kb_articles`\s*\n\s*WHERE `alias`[^\n]*\n\s*AND `category`")
+        # The tree shift must be undoable; #__categories is MyISAM.
+        self.assertIn("UPDATE `#__categories` SET `lft` = `lft` - 2", provisioner)
+        # com_kb lists only categories whose parent is id 1.
+        self.assertIn("$kbRoot = 1;", provisioner)
+
+    def test_example_manifest_does_not_enable_the_navigation_hijack(self):
+        # system/incomplete traps logged-in users on a profile form and
+        # intercepts the logout route: the report is "I cannot log out".
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, "hub.yml.example"), encoding="utf-8") as f:
+            manifest = f.read()
+        enable = manifest.split("enable:", 1)[1].split("disable:", 1)[0]
+        self.assertNotIn("system/incomplete", enable)
+
     def test_provisioner_guards_learned_from_field_deployment(self):
         root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
         with open(os.path.join(root, "docker", "bin", "provision.php"),
@@ -647,6 +681,45 @@ class TemplateWorkflowTests(unittest.TestCase):
                   encoding="utf-8") as f:
             less = f.read()
         self.assertIn('@import "../../../../core/assets/less/site.less";', less)
+        # Core paints these grey/hatched; a template that never restyles them
+        # looks broken on every com_kb/com_groups/com_support page.
+        for selector in (".container-block", ".data-entry"):
+            self.assertIn(selector, less)
+
+    def test_starter_shell_emits_core_component_css_hooks(self):
+        # Core scopes component CSS under `.com_<name>` and `#content`; a
+        # shell without both makes those rules match nothing everywhere.
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        for filename in ("index.php", "component.php"):
+            with open(os.path.join(root, "template-starter", filename),
+                      encoding="utf-8") as f:
+                shell = f.read()
+            self.assertIn("Request::getCmd('option'", shell, filename)
+            self.assertIn('id="content"', shell, filename)
+            self.assertIn("$esc($option)", shell, filename)
+
+    def test_baked_template_install_reads_mounts_as_a_field(self):
+        # A path used as a grep pattern silently fails to match when
+        # /proc/self/mounts octal-escapes whitespace, and the fall-through
+        # branch rm -rf's the developer's bind-mounted working copy.
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, "docker", "bin", "entrypoint.sh"),
+                  encoding="utf-8") as f:
+            entrypoint = f.read()
+        self.assertNotIn('grep -qs " ${target} "', entrypoint)
+        self.assertIn('mountpoint -q -- "$target"', entrypoint)
+        self.assertIn("action=mounted", entrypoint)
+
+    def test_starter_offers_a_tokened_sign_out(self):
+        # Without this the user is stranded: "I can not logout from the site
+        # side". The tokenless com_users route only reaches a confirmation.
+        root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        with open(os.path.join(root, "template-starter", "index.php"),
+                  encoding="utf-8") as f:
+            index = f.read()
+        self.assertIn("User::isGuest()", index)
+        self.assertIn("com_login&task=logout", index)
+        self.assertIn("Session::getFormToken()", index)
 
     def test_template_status_rejects_path_traversal_names(self):
         # A bare "." or ".." must never reach `TEMPLATES_DIR + "/" + name` and

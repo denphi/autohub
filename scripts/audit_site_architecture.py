@@ -229,6 +229,24 @@ def audit(project, require_native_content=False):
             surface for surface, patterns in native_surfaces.items()
             if not all(re.search(pattern, less, re.I) for pattern in patterns)
         ]
+        # Core paints .container/.container-block flat grey, .data-entry dark
+        # grey, and both hatched h3 selectors with a diagonal stripe. A
+        # template that never restyles them looks broken on every com_kb,
+        # com_groups, com_support and com_answers page.
+        core_containers = [name for name, pattern in
+                           ((".container-block", r"\.container-block\b"),
+                            (".data-entry", r"\.data-entry\b"))
+                           if not re.search(pattern, less)]
+        checks.append(check(
+            label + ":core-container-primitives",
+            not core_containers,
+            "restyles core's shared container primitives"
+            if not core_containers else
+            "site.less never restyles " + ", ".join(core_containers)
+            + "; core paints these grey/hatched and they surface in com_kb, "
+              "com_groups, com_support and com_answers",
+        ))
+
         checks.append(check(
             label + ":native-component-styles",
             not missing_surfaces,
@@ -236,6 +254,30 @@ def audit(project, require_native_content=False):
             if not missing_surfaces else
             "site.less lacks baseline styling for: " + ", ".join(missing_surfaces),
         ))
+
+        # Core scopes a large share of its component CSS under the component
+        # name and the content id (`.com_resources .resource-type`,
+        # `#content.com_members`). A shell that omits either makes those rules
+        # match nothing on every component route, which reads as "core's CSS
+        # is ugly" rather than "core's CSS never applied".
+        for filename in ("index.php", "component.php"):
+            shell = read_text(os.path.join(template, filename))
+            if not shell:
+                continue
+            has_option = bool(re.search(
+                r"Request::getCmd\(\s*['\"]option['\"]", shell))
+            has_content_id = bool(re.search(
+                r"""id=["']content["']""", shell))
+            missing = [name for name, present in
+                       (("the active component class", has_option),
+                        ('id="content"', has_content_id)) if not present]
+            checks.append(check(
+                "%s:%s:component-css-hooks" % (label, filename),
+                not missing,
+                "emits the component class and #content" if not missing else
+                filename + " omits " + " and ".join(missing)
+                + "; core's component CSS is scoped under both",
+            ))
 
         php_shell = "\n".join(
             read_text(os.path.join(template, filename))
@@ -257,6 +299,12 @@ def audit(project, require_native_content=False):
     if any(name.endswith(":core-stylesheet-layering") for name in failed_names):
         next_steps.append(
             "Add `@import \"../../../../core/assets/less/site.less\";` so the template layers on core instead of replacing it")
+    if any(name.endswith(":component-css-hooks") for name in failed_names):
+        next_steps.append(
+            "Emit the active component class and id=\"content\" in the template shell so core's component CSS applies")
+    if any(name.endswith(":core-container-primitives") for name in failed_names):
+        next_steps.append(
+            "Restyle core's .container/.container-block/.data-entry primitives; they are grey slabs and hatched headings by default")
     if "no-component-route-shadowing" in failed_names:
         next_steps.append(
             "Rename article aliases that collide with component routes (support, resources, groups, members, search, login, register, tags)")

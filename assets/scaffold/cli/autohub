@@ -283,6 +283,13 @@ class KubernetesDriver:
         self.rel = kc.get("release", "autohub")
         self.chart = kc.get("chart", "deploy/chart")
         self.ingress_host = kc.get("ingress_host", "")
+        # First boot is CPU-bound (clone ~1.1Gi, composer install, schema
+        # import, migrations) and the chart's default limits are sized for a
+        # 2-CPU namespace, so it can take well over 20 minutes there. Too
+        # short a timeout reports a failed release for a cluster that is
+        # merely slow -- and a failed install leaves PVCs holding quota that
+        # then fails the retry.
+        self.timeout = kc.get("timeout", "40m")
         # Comma-separated Helm values overlays (autohub.yml `values_files:`).
         # Without this there is no supported way to tune chart defaults per
         # environment; a hand-written overlay file was silently ignored.
@@ -367,7 +374,7 @@ class KubernetesDriver:
         if self.ingress_host:
             args += ["--set", "ingress.enabled=true",
                      "--set-string", "ingress.host=" + self.ingress_host]
-        args += ["--wait", "--timeout", "20m"]
+        args += ["--wait", "--timeout", self.timeout]
         return self._run(args)
 
     def down(self, volumes=False):

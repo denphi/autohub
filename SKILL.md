@@ -250,7 +250,10 @@ copy, policies, news, and learning articles through the `articles:` section of
 `hub.yml`. Use `resources:` for datasets, tools, downloads, and catalogued
 research objects; `publications:` for native versioned publications;
 `courses:` for native learning hierarchies; `projects:` for their team
-workspaces; `groups:` for communities; and `menus:` for routes. Use
+workspaces; `groups:` for communities; `kb:` for question-and-answer archives,
+FAQs, and help articles; and `menus:` for routes. Do not build an FAQ as one
+article of `<details>` accordions — `com_kb` owns that shape and supplies
+search, per-article routes, categories, and voting. Use
 `article: <alias>` on a menu item to resolve a native article without
 hard-coding its database id.
 
@@ -264,6 +267,7 @@ HUBzero content.
 
 Before provisioning, write down the mapping from each requested item to its
 native owner (`articles`, `projects`, `resources`, `publications`, `courses`,
+`kb`,
 `groups`, or `menus`). If the manifest lacks a required native content surface,
 extend the provisioner and its tests instead of hiding the content in the
 template.

@@ -53,6 +53,12 @@ spec:
                 {{- include "autohub.env" . | nindent 16 }}
               volumeMounts:
                 - { name: backup, mountPath: /var/www/html/app/backups }
+              # Without this the namespace LimitRange decides, and its default
+              # (as low as 32Mi) OOM-kills the dump every night -- or the pod
+              # fails admission on a quota that requires limits, so no backup
+              # is ever taken.
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
           volumes:
             - name: backup
               persistentVolumeClaim:

@@ -139,6 +139,21 @@ No specificity defeats that. Match `!important` from a more specific selector,
 and say why in a comment — an unexplained `!important` is what the next person
 deletes.
 
+**Do not replace a padding shorthand that reserves a pseudo-element gutter.**
+Core positions fontcons absolutely inside the padding it reserves on component
+nav links:
+
+```css
+#page_menu li a { padding: 0.4em 4em 0.4em 3.5em; }
+```
+
+An override that sets `padding` as a shorthand drops that reservation, and
+every icon lands on top of its own label — "D:shboard", "P&ofile", "A&count".
+Nothing errors; it looks like a broken icon font. Extend the longhand
+(`padding-top`, `padding-bottom`) or preserve the space core reserved, and
+check any rule that touches `padding`, `margin`, `background`, or `content` on
+a selector core decorates with `::before`/`::after`.
+
 ## Remember what a shim stops declaring
 
 Reducing an override to a shim that includes core's template is the best outcome
