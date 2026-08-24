@@ -115,10 +115,21 @@ cli/autohub verify --scope <site|tls|assets|components|mail|login|db> --json
 cli/autohub db query "SELECT ... FROM jos_extensions" --json
 ```
 
-Keep database queries read-only and avoid credential, session, token, or
-personal-data columns. Use interactive `db shell`, streaming logs, or raw
-`muse` only when the task requires them; those operations do not produce a
-single JSON result.
+`db query` accepts one read-only statement and refuses anything else,
+including a second statement smuggled after a semicolon or a comment. It
+connects as the unprivileged application account in a read-only session, so a
+mutating statement fails even if it reaches the server. Avoid credential,
+session, token, or personal-data columns. A diagnostic write requires
+`--write --force --confirm <exact-target-id>`; treat that as the same class of
+operation as `destroy` or `restore`, and remember that a live database edit is
+never the final fix. Use interactive `db shell`, streaming logs, or raw `muse`
+only when the task requires them; those operations do not produce a single
+JSON result, and `db shell` is an unrestricted root session with none of the
+guards `db query` applies.
+
+`doctor` scans only the current boot. Container logs are cumulative, so an
+error from the attempt you just fixed would otherwise fail the retry that
+fixed it; pass `--all-boots` when a crash loop makes earlier boots relevant.
 
 Map common evidence to the smallest relevant action:
 
@@ -131,6 +142,9 @@ Map common evidence to the smallest relevant action:
 | Changed CSS appears stale | no server error; old browser bytes | clear and warm caches, then hard-reload |
 | Browser reports an untrusted certificate | TLS scope or `tls status` fails | run authorized `tls setup`, recreate the web service, then verify TLS |
 | Provision refuses a stale manifest, or reports "manifest is empty" against a non-empty hub.yml | provision preflight; mounted hub.yml differs from the project file | Docker: `down` then `up --wait` (a single-file bind mount is not remounted by `up` alone); Kubernetes: `up` refreshes the manifest ConfigMap and rolls the pod |
+| Every HTTP check fails at once on Kubernetes | `verify` reports `site URL resolvable` false | set `ingress_host:` under `kubernetes:` in `autohub.yml`, or expose the release through an Ingress |
+| `verify --scope login` reports credentials withheld | host does not trust the certificate | run authorized `tls setup`, then retry; the password is never sent over an untrusted connection |
+| A failure pattern persists after it was fixed | `doctor` matched an earlier boot | `doctor` scans the current boot by default; use `--all-boots` deliberately when chasing a crash loop |
 | A route serves the wrong content but returns 200 | an article alias matches a component route, or a resource uses a middleware `Tools` type | rename the article alias; model the record on a non-middleware resource type |
 
 ## Apply configuration changes

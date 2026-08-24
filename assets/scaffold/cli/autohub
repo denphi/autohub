@@ -106,6 +106,37 @@ def _yaml_scalar(val):
     return (val[:cut.start()] if cut else val).strip()
 
 
+def _yaml_number(value):
+    """Keep an integer-looking chart value typed; quote anything else."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _render_yaml(mapping, indent=0):
+    """Serialize a shallow mapping as YAML, without a YAML dependency.
+
+    JSON is a subset of YAML 1.2, so json.dumps produces a correctly escaped
+    scalar for any string — including the commas, colons and quotes that made
+    `--set` unsafe. Strings stay quoted so a value like `1.2` or `latest`
+    reaches the chart as a string, preserving what --set-string guaranteed.
+    """
+    lines = []
+    pad = " " * indent
+    for key, value in mapping.items():
+        if isinstance(value, dict):
+            lines.append("%s%s:" % (pad, key))
+            lines.append(_render_yaml(value, indent + 2))
+        elif isinstance(value, bool):
+            lines.append("%s%s: %s" % (pad, key, "true" if value else "false"))
+        elif isinstance(value, int):
+            lines.append("%s%s: %d" % (pad, key, value))
+        else:
+            lines.append("%s%s: %s" % (pad, key, json.dumps(str(value))))
+    return "\n".join(line for line in lines if line)
+
+
 def read_autohub_config(project_dir):
     """Parse autohub.yml — the infrastructure manifest (driver selection, k8s
     settings). Absent = docker defaults. A deliberately tiny two-level parser so
@@ -141,14 +172,61 @@ SECRET_RE = re.compile(
     r"xox[baprs]-[A-Za-z0-9-]+|(?:PASSWORD|PASS|TOKEN|SECRET)=\S+)",
     re.IGNORECASE)
 
+# .env keys whose *values* are secret. A generated password echoed back by
+# mariadb ("Access denied for user ... using password"), apache, git or a stack
+# trace matches none of the shapes in SECRET_RE, so pattern matching alone
+# cannot keep it out of JSON output. We hold the real values already — redact
+# those literally too (R8).
+SECRET_KEY_RE = re.compile(
+    r"(PASSWORD|PASSWD|SECRET|TOKEN|CREDENTIAL|PRIVATE_KEY|API_?KEY)", re.I)
+
+# Shorter than this and a "secret" is more likely to be a placeholder or a
+# common word whose redaction would mangle unrelated output.
+SECRET_MIN_LEN = 8
+
+SECRET_VALUES = []
+
+
+def register_secret_values(env):
+    """Load this project's literal secrets so scrub() can remove them by value.
+
+    Called once from main() with the parsed .env. Longest first, so a value
+    that contains a shorter one is replaced whole instead of leaving a
+    fragment behind.
+    """
+    global SECRET_VALUES
+    found = set()
+    for key, value in (env or {}).items():
+        if not value or len(value) < SECRET_MIN_LEN:
+            continue
+        if SECRET_KEY_RE.search(key):
+            found.add(value)
+    SECRET_VALUES = sorted(found, key=len, reverse=True)
+
+
 def scrub(text):
     """Never let a token or password reach output or logs (R8)."""
-    return SECRET_RE.sub("[redacted]", text or "")
+    text = text or ""
+    for value in SECRET_VALUES:
+        if value in text:
+            text = text.replace(value, "[redacted]")
+    return SECRET_RE.sub("[redacted]", text)
 
 
 # ---------------------------------------------------------------------------
 # driver layer
 # ---------------------------------------------------------------------------
+
+# A wedged container, an unreachable cluster or a probe blocked on a filtered
+# port must not hang the CLI forever: an agent driving this contract has
+# nothing to react to until a command returns. Every container exec is capped;
+# the handful of genuinely slow operations pass their own larger value.
+EXEC_TIMEOUT = 300          # probes, queries, short management commands
+ASSET_TIMEOUT = 900         # LESS/asset compilation, muse
+PROVISION_TIMEOUT = 1800    # manifest provisioning, migrations, restore unpack
+UPDATE_TIMEOUT = 3600       # source pull + composer + schema
+STREAM_TIMEOUT = 3600       # database dump/restore streamed to or from a file
+
 
 GZIP_MAGIC = b"\x1f\x8b"
 
@@ -223,7 +301,8 @@ class DockerDriver:
     def exec(self, service, cmd, stdin=None, timeout=None):
         """Run a command inside a service container (non-tty)."""
         return self._run(self.compose + ["exec", "-T", service] + cmd,
-                         stdin=stdin, timeout=timeout)
+                         stdin=stdin,
+                         timeout=EXEC_TIMEOUT if timeout is None else timeout)
 
     def up(self):
         # docker/Dockerfile COPYs the project's templates/ into the image so
@@ -276,23 +355,26 @@ class DockerDriver:
         """Interactive (tty) exec — inherits the terminal, no capture."""
         return subprocess.run(self.compose + ["exec", service] + cmd, cwd=self.dir)
 
-    def stream_to_file(self, service, cmd, path):
+    def stream_to_file(self, service, cmd, path, timeout=STREAM_TIMEOUT):
         """Stream binary command output to a host file without buffering it."""
         with open(path, "wb") as out:
             r = subprocess.run(self.compose + ["exec", "-T", service] + cmd,
-                               cwd=self.dir, stdout=out, stderr=subprocess.PIPE)
+                               cwd=self.dir, stdout=out, stderr=subprocess.PIPE,
+                               timeout=timeout)
         stderr = r.stderr.decode("utf-8", "replace")
+        # Never hand back a corrupted artifact; see _repair_streamed_payload.
         if r.returncode == 0:
             bad = _repair_streamed_payload(path)
             if bad:
                 return subprocess.CompletedProcess(r.args, 1, "", (stderr + "\n" + bad).strip())
         return subprocess.CompletedProcess(r.args, r.returncode, "", stderr)
 
-    def stream_from_file(self, service, cmd, path):
+    def stream_from_file(self, service, cmd, path, timeout=STREAM_TIMEOUT):
         """Stream a host file to a command's stdin without putting it in argv."""
         with open(path, "rb") as src:
             r = subprocess.run(self.compose + ["exec", "-T", service] + cmd,
-                               cwd=self.dir, stdin=src, capture_output=True)
+                               cwd=self.dir, stdin=src, capture_output=True,
+                               timeout=timeout)
         return subprocess.CompletedProcess(r.args, r.returncode,
             r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace"))
 
@@ -352,6 +434,9 @@ class KubernetesDriver:
         self.values_files = [v.strip() for v in
                              str(kc.get("values_files", "")).split(",")
                              if v.strip()]
+        # Resolved lazily from the cluster when autohub.yml omits the host.
+        # None = not looked up yet, "" = looked up and absent.
+        self._discovered_host = None
         ctx = kc.get("context", "")
         self.context = ctx
         base = ["kubectl"] + (["--context", ctx] if ctx else [])
@@ -360,8 +445,17 @@ class KubernetesDriver:
         self._helm = ["helm"] + (["--kube-context", ctx] if ctx else []) + ["-n", self.ns]
 
     def _run(self, args, capture=True, stdin=None, timeout=None):
-        return subprocess.run(args, cwd=self.dir, capture_output=capture,
-                              text=True, input=stdin, timeout=timeout)
+        try:
+            return subprocess.run(args, cwd=self.dir, capture_output=capture,
+                                  text=True, input=stdin, timeout=timeout)
+        except FileNotFoundError:
+            # url() and target_id() shell out during ordinary reporting, so a
+            # missing binary must read as a failed command rather than crash
+            # out of the JSON contract with a bare OSError.
+            return subprocess.CompletedProcess(
+                args, 127, "",
+                "%s not found on PATH; the kubernetes driver requires kubectl "
+                "and helm" % (args[0] if args else "command"))
 
     def _ref(self, service):
         if service not in self.WORKLOADS:
@@ -373,7 +467,8 @@ class KubernetesDriver:
         ref, container = self._ref(service)
         args = self._kubectl + ["exec", "-c", container]
         args += (["-i"] if stdin is not None else []) + [ref, "--"] + cmd
-        return self._run(args, stdin=stdin, timeout=timeout)
+        return self._run(args, stdin=stdin,
+                         timeout=EXEC_TIMEOUT if timeout is None else timeout)
 
     def _ensure_namespace(self):
         r = self._run(self._kubectl_base + ["get", "namespace", self.ns])
@@ -390,6 +485,34 @@ class KubernetesDriver:
         return self._run(self._kubectl + ["apply", "-f", "-"],
                          stdin="\n".join(lines) + "\n")
 
+    def release_values(self):
+        """The .env-derived half of the release, as a values mapping.
+
+        Built as YAML rather than a string of `--set` flags: helm splits --set
+        on unescaped commas, so an ordinary hub name ("Nanoscale Hub, Inc.")
+        silently became a second, bogus key. Values here also stay out of
+        argv, which matters because HUBZERO_REPO may carry a token (R8).
+        """
+        values = {}
+        env_values = {k: self.env[k] for k in self.ENV_KEYS if self.env.get(k)}
+        if env_values:
+            values["env"] = env_values
+        img = self.env.get("HUB_IMAGE", "")
+        if img:
+            repo, _, tag = img.partition(":")
+            values["image"] = {"repository": repo, "tag": tag or "latest"}
+        b = self.backup
+        if str(b.get("enabled", "")).lower() in ("1", "true", "yes"):
+            backup = {"enabled": True}
+            if b.get("schedule"):
+                backup["schedule"] = str(b["schedule"])
+            if b.get("keep"):
+                backup["keep"] = _yaml_number(b["keep"])
+            values["backup"] = backup
+        if self.ingress_host:
+            values["ingress"] = {"enabled": True, "host": self.ingress_host}
+        return values
+
     def up(self):
         # helm is declarative + idempotent: install or converge in one call.
         self._ensure_namespace()
@@ -398,9 +521,11 @@ class KubernetesDriver:
             return s
         args = self._helm + ["upgrade", "--install", self.rel,
             os.path.join(self.dir, self.chart)]
-        # Overlays first: helm gives every --set below precedence over -f, so
-        # an overlay tunes chart defaults while .env-derived identity still
-        # wins. A missing file is an error, not a silent no-op.
+        # User overlays first, then ours: helm lets a later -f override an
+        # earlier one, which is what preserves ".env identity wins over a
+        # tuning overlay" now that identity is a values file rather than the
+        # --set flags that used to outrank every -f. A missing file is an
+        # error, not a silent no-op.
         for values in self.values_files:
             path = values if os.path.isabs(values) \
                 else os.path.join(self.dir, values)
@@ -408,30 +533,30 @@ class KubernetesDriver:
                 return subprocess.CompletedProcess(["helm"], 1, "",
                     "values file from autohub.yml does not exist: " + path)
             args += ["-f", path]
-        args += ["--set", "secret.existingSecret=%s-secret" % self.rel]
-        manifest = os.path.join(self.dir, "hub.yml")
-        if os.path.isfile(manifest):
-            args += ["--set-file", "hubManifest=" + manifest]
-        img = self.env.get("HUB_IMAGE", "")
-        if img:
-            repo, _, tag = img.partition(":")
-            args += ["--set-string", "image.repository=" + repo,
-                     "--set-string", "image.tag=" + (tag or "latest")]
-        for k in self.ENV_KEYS:
-            if self.env.get(k):
-                args += ["--set-string", "env.%s=%s" % (k, self.env[k])]
-        b = self.backup
-        if str(b.get("enabled", "")).lower() in ("1", "true", "yes"):
-            args += ["--set", "backup.enabled=true"]
-            if b.get("schedule"):
-                args += ["--set-string", "backup.schedule=" + str(b["schedule"])]
-            if b.get("keep"):
-                args += ["--set", "backup.keep=" + str(b["keep"])]
-        if self.ingress_host:
-            args += ["--set", "ingress.enabled=true",
-                     "--set-string", "ingress.host=" + self.ingress_host]
-        args += ["--wait", "--timeout", self.timeout]
-        return self._run(args)
+        # mkstemp gives mode 0600 and a path outside the project, so a token
+        # in HUBZERO_REPO is neither world-readable nor left in the working
+        # tree if helm fails.
+        fd, generated = tempfile.mkstemp(prefix="autohub-values-", suffix=".yaml")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                # `or "{}"`: a project with no .env yet renders nothing, and
+                # helm reads a zero-byte -f as null rather than an empty map.
+                stream.write(_render_yaml(self.release_values()) or "{}")
+                stream.write("\n")
+            args += ["-f", generated]
+            # These two carry no user-supplied text, so --set stays correct
+            # and keeps them outranking every values file.
+            args += ["--set", "secret.existingSecret=%s-secret" % self.rel]
+            manifest = os.path.join(self.dir, "hub.yml")
+            if os.path.isfile(manifest):
+                args += ["--set-file", "hubManifest=" + manifest]
+            args += ["--wait", "--timeout", self.timeout]
+            return self._run(args)
+        finally:
+            try:
+                os.unlink(generated)
+            except OSError:
+                pass
 
     def down(self, volumes=False):
         r = self._run(self._helm + ["uninstall", self.rel])
@@ -500,11 +625,12 @@ class KubernetesDriver:
         return subprocess.run(self._kubectl + ["exec", "-it", "-c", container, ref, "--"] + cmd,
                               cwd=self.dir)
 
-    def stream_to_file(self, service, cmd, path):
+    def stream_to_file(self, service, cmd, path, timeout=STREAM_TIMEOUT):
         ref, container = self._ref(service)
         args = self._kubectl + ["exec", "-c", container, ref, "--"] + cmd
         with open(path, "wb") as out:
-            r = subprocess.run(args, cwd=self.dir, stdout=out, stderr=subprocess.PIPE)
+            r = subprocess.run(args, cwd=self.dir, stdout=out,
+                               stderr=subprocess.PIPE, timeout=timeout)
         # A cluster runtime can print a notice into this stream; see
         # _repair_streamed_payload. Never hand back a corrupted artifact.
         if r.returncode == 0:
@@ -514,11 +640,12 @@ class KubernetesDriver:
         return subprocess.CompletedProcess(r.args, r.returncode, "",
                                            r.stderr.decode("utf-8", "replace"))
 
-    def stream_from_file(self, service, cmd, path):
+    def stream_from_file(self, service, cmd, path, timeout=STREAM_TIMEOUT):
         ref, container = self._ref(service)
         args = self._kubectl + ["exec", "-i", "-c", container, ref, "--"] + cmd
         with open(path, "rb") as src:
-            r = subprocess.run(args, cwd=self.dir, stdin=src, capture_output=True)
+            r = subprocess.run(args, cwd=self.dir, stdin=src,
+                               capture_output=True, timeout=timeout)
         return subprocess.CompletedProcess(r.args, r.returncode,
             r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace"))
 
@@ -530,9 +657,23 @@ class KubernetesDriver:
         return "kubernetes:%s:%s:%s" % (context, self.ns, self.rel)
 
     def url(self):
+        """The hub's browser URL, or "" when it cannot be determined.
+
+        This used to return the placeholder "https://<rel-web service>", which
+        is not a URL: every HTTP check then failed with "HTTP 0, URL can't
+        contain control characters" and a healthy hub looked entirely down.
+        """
         if self.ingress_host:
             return "https://" + self.ingress_host
-        return "https://<%s-web service>" % self.rel
+        # The chart may have created an Ingress even when autohub.yml omits
+        # the host, so ask the cluster before giving up.
+        if self._discovered_host is None:
+            r = self._run(self._kubectl + [
+                "get", "ingress", "-l", "app.kubernetes.io/instance=" + self.rel,
+                "-o", "jsonpath={.items[0].spec.rules[0].host}"], timeout=30)
+            self._discovered_host = \
+                (r.stdout or "").strip() if r.returncode == 0 else ""
+        return "https://" + self._discovered_host if self._discovered_host else ""
 
 
 def get_driver(project_dir, env, dev=False):
@@ -624,6 +765,43 @@ def http_get(url, timeout=20, headers=None):
         return e.code, e.read() if e.fp else b"", dict(e.headers or {})
     except Exception as e:
         return 0, str(e).encode(), {}
+
+
+# ---------------------------------------------------------------------------
+# boot-scoped log reading
+#
+# Container logs are cumulative across restarts, so scanning the whole buffer
+# reads the *previous* boot's failures as if they were current: an [hub] ERROR
+# from the attempt you just fixed fails the retry that fixed it. entrypoint.sh
+# logs a marker at the top of every start, so slicing at its last occurrence
+# scopes the scan to the current boot without depending on host, daemon and
+# container clocks agreeing — which --since would.
+# ---------------------------------------------------------------------------
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# entrypoint.sh:22, emitted before any other work. lib.sh wraps "[hub]" in
+# colour codes, so the marker text is matched without the prefix.
+BOOT_MARKER = "HUBzero container starting"
+
+# Enough lines to hold a first boot (clone, composer, schema, migrations) so
+# the marker cannot scroll out of the window between polls.
+BOOT_LOG_LINES = 5000
+
+
+def _combined_log(result):
+    return ANSI_RE.sub("", (result.stdout or "") + (result.stderr or ""))
+
+
+def _current_boot_log(text):
+    """Return only the portion of a log buffer belonging to the latest boot.
+
+    Falls back to the whole buffer when the marker is absent — an older image,
+    or a window too small to contain it. That is the previous behaviour, so
+    the fallback can over-report but never hides a current failure.
+    """
+    index = (text or "").rfind(BOOT_MARKER)
+    return text if index == -1 else text[index:]
 
 
 def _last_stdout_line(result):
@@ -778,7 +956,7 @@ def _restore_snapshot(drv, path, metadata, res):
     if source_commit:
         r = drv.exec("web", ["bash", "-c",
             'set -e; HUBZERO_REF="$1" hub-source-sync --update; hub-composer; hub-config-render',
-            "_", source_commit])
+            "_", source_commit], timeout=UPDATE_TIMEOUT)
         if r.returncode != 0:
             res.fail("source rollback failed: " + scrub(r.stderr or r.stdout).strip())
             return False
@@ -1169,8 +1347,11 @@ def cmd_up(drv, env, args, res):
         deadline = time.time() + args.timeout
         status = "timeout"
         while time.time() < deadline:
-            r = drv.logs(service="web", tail=400)
-            out = (r.stdout or "") + (r.stderr or "")
+            # Read a window large enough to contain the boot marker: a fixed
+            # 400 lines can let "bootstrap complete" scroll past between polls
+            # on a chatty first boot, reporting a timeout for a healthy hub.
+            out = _current_boot_log(
+                _combined_log(drv.logs(service="web", tail=BOOT_LOG_LINES)))
             if re.search(r"\[hub\] ERROR", out):
                 status = "error"
                 break
@@ -1248,7 +1429,8 @@ def cmd_status(drv, env, args, res):
         res.check("service:%s" % s["service"],
                   s["state"] == "running",
                   s["health"] or s["state"])
-    res.say("url: %s" % drv.url())
+    url = drv.url()
+    res.say("url: %s" % (url or "unresolved — " + NO_SITE_URL_REMEDY))
     return res
 
 
@@ -1325,7 +1507,7 @@ def _refuse_stale_manifest(drv, res):
 def cmd_provision(drv, env, args, res):
     if _refuse_stale_manifest(drv, res):
         return res
-    r = drv.exec("web", ["hub-provision"])
+    r = drv.exec("web", ["hub-provision"], timeout=PROVISION_TIMEOUT)
     out = scrub((r.stdout or "") + (r.stderr or ""))
     for line in out.splitlines():
         if line.strip():
@@ -1401,7 +1583,7 @@ def cmd_assets(drv, env, args, res):
         return res
     # hub-assets [--clean]: no arg = compile only; --clean = clear then recompile
     cmd = ["hub-assets"] + (["--clean"] if args.sub == "clean" else [])
-    r = drv.exec("web", cmd)
+    r = drv.exec("web", cmd, timeout=ASSET_TIMEOUT)
     out = (r.stdout or "") + (r.stderr or "")
     for line in out.splitlines():
         if line.strip():
@@ -1421,9 +1603,11 @@ def cmd_cache(drv, env, args, res):
     out = (r.stdout or "") + (r.stderr or "")
     res.say(re.sub(r"\x1b\[[0-9;]*m", "", out).strip() or "cache cleared")
     if args.warm:
-        code, _, _ = http_get(drv.url() + "/")
-        res.check("cache warmed (homepage recompiles site.css)", code == 200,
-                  "HTTP %s" % code)
+        base = _require_site_url(drv, res, "cache warming")
+        if base:
+            code, _, _ = http_get(base + "/")
+            res.check("cache warmed (homepage recompiles site.css)", code == 200,
+                      "HTTP %s" % code)
     else:
         res.suggest("cli/autohub cache clear --warm --json")
     return res
@@ -1485,11 +1669,39 @@ def _sweep_page_assets(base, page_url, body):
             bad.append("%s -> %s" % (raw, code))
     return links, bad
 
-def cmd_verify(drv, env, args, res):
-    base = drv.url()
-    scope = args.scope
+NO_SITE_URL_REMEDY = (
+    "no ingress host: set `ingress_host:` under `kubernetes:` in autohub.yml, "
+    "or expose the release through an Ingress; HTTP checks cannot run without "
+    "a reachable URL")
 
-    if scope in ("all", "tls"):
+
+def _require_site_url(drv, res, what="HTTP checks"):
+    """Resolve the hub URL, or record one actionable failure and return "".
+
+    Reporting this as a failure rather than a skip is deliberate: the caller
+    asked for verification and none happened, and a green "skipped" is exactly
+    the silent success the safety model forbids.
+    """
+    base = drv.url()
+    if not base:
+        res.check("site URL resolvable", False, NO_SITE_URL_REMEDY)
+        res.say("%s were not run" % what)
+    return base
+
+
+# Scopes that reach the hub over HTTP; mail and db run inside the container
+# and stay verifiable without a URL.
+HTTP_SCOPES = ("all", "site", "assets", "components", "tls", "login")
+
+
+def cmd_verify(drv, env, args, res):
+    scope = args.scope
+    base = ""
+    if scope in HTTP_SCOPES:
+        base = _require_site_url(
+            drv, res, "site, asset, component, TLS and login checks")
+
+    if base and scope in ("all", "tls"):
         if drv.name == "docker":
             _inspect_local_certificate(drv.dir, env, res)
         trusted, detail = _host_https_trust(base + "/")
@@ -1497,12 +1709,12 @@ def cmd_verify(drv, env, args, res):
         if not trusted and drv.name == "docker":
             res.suggest("cli/autohub tls setup --json")
 
-    if scope in ("all", "site"):
+    if base and scope in ("all", "site"):
         for path, want in [("/", 200), ("/administrator/", 200)]:
             code, _, _ = http_get(base + path)
             res.check("GET %s" % path, code == want, "HTTP %s" % code)
 
-    if scope in ("all", "assets"):
+    if base and scope in ("all", "assets"):
         code, body, _ = http_get(base + "/app/cache/site/site.css")
         compiled = code == 200 and len(body) > 1000
         res.check("compiled site.css", compiled,
@@ -1518,7 +1730,7 @@ def cmd_verify(drv, env, args, res):
             res.check("homepage asset sweep (%d links)" % len(links),
                       not bad, "; ".join(bad[:5]))
 
-    if scope in ("all", "components"):
+    if base and scope in ("all", "components"):
         routes = [path for path, _component in CORE_COMPONENT_ROUTES]
         routes.extend(_discover_menu_routes(drv, env))
         routes.extend(getattr(args, "route", []) or [])
@@ -1547,12 +1759,14 @@ def cmd_verify(drv, env, args, res):
         if not okmail:
             res.say("mail failures cause 500s on core actions (group save etc.)")
 
-    if scope in ("all", "login"):
+    if base and scope in ("all", "login"):
         user = env.get("HUB_ADMIN_USER")
         pw = env.get("HUB_ADMIN_PASSWORD")
         if user and pw:
             ok, detail = _try_admin_login(base, user, pw)
             res.check("admin login", ok, detail)
+            if not ok and "untrusted connection" in detail:
+                res.suggest("cli/autohub tls setup --json")
         else:
             res.check("admin login", False,
                       "not run: HUB_ADMIN_USER/PASSWORD missing from .env")
@@ -1582,7 +1796,26 @@ def _classify_admin_login_page(page):
 
 
 def _try_admin_login(base, user, pw):
-    """End-to-end /administrator login with the CSRF token dance."""
+    """End-to-end /administrator login with the CSRF token dance.
+
+    This is the only probe that transmits a credential, so unlike the
+    unauthenticated GETs it refuses to run over a connection the host does not
+    trust: HUB_ADMIN_PASSWORD must never cross a link that would accept any
+    certificate.
+
+    The gate is _host_https_trust -- curl, i.e. the system trust store --
+    rather than a verified SSL context here. mkcert installs its CA where curl
+    and the browser find it, while Python's default context frequently reads a
+    bundled CA file that has never heard of it, so verifying in-process would
+    report a correctly trusted local hub as untrusted and refuse a login that
+    is perfectly safe. Trust is answered once, by the authority that agrees
+    with the browser; the request below then reuses that answer.
+    """
+    trusted, detail = _host_https_trust(base + "/administrator/index.php")
+    if not trusted:
+        return False, ("not verified: administrator credentials were withheld "
+                       "from an untrusted connection (%s); run authorized "
+                       "`tls setup`, then retry" % detail)
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -1640,16 +1873,25 @@ DOCTOR_PATTERNS = [
 ]
 
 def cmd_doctor(drv, env, args, res):
-    r = drv.logs(service="web", tail=args.tail)
-    out = (r.stdout or "") + (r.stderr or "")
+    out = _combined_log(drv.logs(service="web", tail=args.tail))
+    scope = "all boots"
+    if not getattr(args, "all_boots", False):
+        scoped = _current_boot_log(out)
+        if scoped != out:
+            scope = "current boot"
+        out = scoped
     found = 0
     for pat, advice in DOCTOR_PATTERNS:
         hits = re.findall(pat, out)
         if hits:
             found += 1
             res.check("pattern: %s" % pat[:48], False, advice)
+    res.say("scanned %s of the last %d log lines" % (scope, args.tail))
     if not found:
-        res.say("no known failure patterns in the last %d log lines" % args.tail)
+        res.say("no known failure patterns found")
+        if scope == "current boot":
+            res.say("pass --all-boots to include earlier boots (useful for a "
+                    "crash loop)")
     res.suggest("cli/autohub verify --json")
     if found:
         res.suggest("cli/autohub logs --errors --json")
@@ -1679,15 +1921,132 @@ def cmd_logs(drv, env, args, res):
     return res
 
 
+# ---------------------------------------------------------------------------
+# read-only SQL enforcement
+#
+# SKILL.md tells the agent to keep `db query` read-only, but prose is not a
+# guard: every other mutating path in this file demands --force and an exact
+# target, and diagnosis is the path an agent reaches for most casually. The
+# classifier below is the first of two layers; cmd_db supplies the second by
+# connecting as the unprivileged application account in a read-only session.
+# ---------------------------------------------------------------------------
+
+# `mariadb -e` executes every statement in the string, so a second statement
+# is a full bypass. These verbs may open a statement; nothing else may.
+READ_ONLY_VERBS = ("select", "show", "describe", "desc", "explain", "with")
+
+# Constructs that write, or read outside the database, from inside a SELECT.
+UNSAFE_CONSTRUCT_RE = re.compile(
+    r"\binto\s+(outfile|dumpfile)\b|\bload_file\s*\(|\bsys_(exec|eval)\s*\(",
+    re.I)
+
+# MariaDB accepts CTEs in front of UPDATE and DELETE, so `with` alone does not
+# prove a statement reads. (`show create table` legitimately contains "create",
+# which is why this is scoped to the WITH form rather than applied globally.)
+CTE_WRITE_RE = re.compile(r"\b(insert|update|delete|replace)\b", re.I)
+
+
+def _mask_sql_literals(sql):
+    """Blank out comments and quoted text so the classifier sees only SQL
+    structure. Without this, a `;` or a verb inside a string literal reads as
+    real syntax and a legitimate query gets refused -- or worse, a crafted
+    literal hides a second statement.
+    """
+    out = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch in ("'", '"', "`"):
+            out.append(" ")
+            i += 1
+            while i < n:
+                if sql[i] == "\\" and ch != "`":     # backslash escape
+                    i += 2
+                    continue
+                if sql[i] == ch:
+                    if i + 1 < n and sql[i + 1] == ch:   # doubled quote
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        # MySQL requires whitespace after `--`; treating a bare `--` as a
+        # comment would mask the `;` in `SELECT 1--1; DROP TABLE x`, which the
+        # server does execute as two statements.
+        if sql[i:i + 2] == "--" and (i + 2 >= n or sql[i + 2] in " \t\r\n"):
+            while i < n and sql[i] != "\n":
+                i += 1
+            continue
+        if ch == "#":
+            while i < n and sql[i] != "\n":
+                i += 1
+            continue
+        if sql[i:i + 2] == "/*":
+            end = sql.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _reject_non_read_only_sql(sql):
+    """Return a refusal message, or "" when the statement only reads."""
+    masked = _mask_sql_literals(sql).strip()
+    if not masked:
+        return "refusing an empty or comment-only statement"
+    stripped = masked.rstrip().rstrip(";").rstrip()
+    if ";" in stripped:
+        return ("refusing multiple statements: `db query` runs exactly one "
+                "read-only statement")
+    verb = re.match(r"[a-z_]+", stripped, re.I)
+    verb = verb.group(0).lower() if verb else ""
+    if verb not in READ_ONLY_VERBS:
+        return ("refusing a non-read-only statement: `%s` is not one of %s"
+                % (verb or stripped[:20], ", ".join(v.upper() for v in READ_ONLY_VERBS)))
+    if verb == "with" and CTE_WRITE_RE.search(stripped):
+        return "refusing a common table expression that feeds a write statement"
+    unsafe = UNSAFE_CONSTRUCT_RE.search(stripped)
+    if unsafe:
+        return ("refusing a statement that reads or writes the filesystem: %s"
+                % unsafe.group(0).strip())
+    return ""
+
+
 def cmd_db(drv, env, args, res):
     if args.sub == "query":
         sql = args.arg
         if not sql:
             res.fail("query needs SQL: autohub db query \"SELECT ...\"")
             return res
-        r = drv.exec("db", ["sh", "-c",
-            'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" "$MARIADB_DATABASE" -t -e "$1"',
-            "_", sql])
+        write = getattr(args, "write", False)
+        if write:
+            # A write here is a diagnostic, never the final fix (SKILL.md):
+            # gate it exactly like every other mutating path.
+            if not _require_destructive_confirmation(
+                    drv, args, res, "run a write statement against the live database"):
+                return res
+            res.say("running a WRITE statement; a live database edit is a "
+                    "diagnostic — persist the change in hub.yml or the provisioner")
+            # Writes need the owning account; reads deliberately do not.
+            command = ('exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" '
+                       '"$MARIADB_DATABASE" -t -e "$1"')
+        else:
+            refusal = _reject_non_read_only_sql(sql)
+            if refusal:
+                res.fail(refusal)
+                res.say("read-only statements only; pass --write --force "
+                        "--confirm %s to run a mutating statement" % drv.target_id())
+                return res
+            # Two independent guards: the classifier above, and a connection
+            # that lacks both FILE and any privilege outside this database.
+            # The session is read-only so a statement that slips past the
+            # classifier is still refused by the server.
+            command = ('exec mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" '
+                       '"$MARIADB_DATABASE" -t '
+                       '-e "SET SESSION TRANSACTION READ ONLY; $1"')
+        r = drv.exec("db", ["sh", "-c", command, "_", sql])
         out = scrub(r.stdout or "")
         if getattr(args, "json", False):
             for line in out.splitlines():
@@ -1750,7 +2109,7 @@ def cmd_backup(drv, env, args, res):
 
 
 def cmd_migrate(drv, env, args, res):
-    r = drv.exec("web", ["hub-migrate"])
+    r = drv.exec("web", ["hub-migrate"], timeout=PROVISION_TIMEOUT)
     res.say(scrub((r.stdout or "") + (r.stderr or "")).strip())
     res.check("migrations", r.returncode == 0)
     return res
@@ -1956,7 +2315,7 @@ def cmd_template(drv, env, args, res):
             # exit status is git push's (the last command)
             'GITTOK="$%s" GIT_ASKPASS="$AP" git push %s "$URL" "$BR" 2>&1' % (tokenenv, force),
         ])
-        r = drv.exec("web", ["bash", "-c", script])
+        r = drv.exec("web", ["bash", "-c", script], timeout=ASSET_TIMEOUT)
         for line in scrub(r.stdout or "").splitlines():
             if line.strip():
                 res.say(line)
@@ -1979,7 +2338,7 @@ def cmd_update(drv, env, args, res):
             res.fail("pre-update full-state snapshot failed; refusing to update")
             return res
     cmd = ["hub-update"] + ([args.ref] if args.ref else [])
-    r = drv.exec("web", cmd)
+    r = drv.exec("web", cmd, timeout=UPDATE_TIMEOUT)
     res.say(scrub((r.stdout or "") + (r.stderr or "")).strip())
     res.check("update", r.returncode == 0)
     if r.returncode == 0:
@@ -1992,7 +2351,7 @@ def cmd_update(drv, env, args, res):
 
 
 def cmd_muse(drv, env, args, res):
-    r = drv.exec("web", ["hub-muse"] + args.args)
+    r = drv.exec("web", ["hub-muse"] + args.args, timeout=ASSET_TIMEOUT)
     out = scrub(re.sub(r"\x1b\[[0-9;]*m", "", (r.stdout or "") + (r.stderr or "")))
     if getattr(args, "json", False):
         for line in out.splitlines():
@@ -2094,7 +2453,9 @@ def _component_plan(drv, domain, args, res, content_root=None):
 
 def _verify_component_routes(drv, routes, res):
     """Prove component routes render their native component, not a catch-all."""
-    base = drv.url().rstrip("/")
+    base = _require_site_url(drv, res, "component route verification").rstrip("/")
+    if not base:
+        return
     for route in routes or []:
         status, body, _headers = http_get(base + route)
         text_body = body.decode("utf-8", "replace")
@@ -2298,6 +2659,8 @@ def build_parser():
 
     s = add("doctor", help="match recent logs against known failures")
     s.add_argument("--tail", type=int, default=400)
+    s.add_argument("--all-boots", action="store_true",
+                   help="scan earlier boots too (default: current boot only)")
     s.set_defaults(fn=cmd_doctor)
 
     s = add("logs", help="web logs")
@@ -2311,8 +2674,12 @@ def build_parser():
     s.add_argument("sub", choices=["shell", "query", "dump", "restore"])
     s.add_argument("arg", nargs="?",
                    help="SQL for `query` (jos_ prefix), or dump file for `restore`")
+    s.add_argument("--write", action="store_true",
+                   help="allow `query` to run a mutating statement; also needs "
+                        "--force and --confirm")
     s.add_argument("--force", action="store_true",
-                   help="required for `restore` (overwrites the live database)")
+                   help="required for `restore` and for `query --write` "
+                        "(both change the live database)")
     s.add_argument("--confirm", help="exact target id printed by `autohub status`")
     s.set_defaults(fn=cmd_db)
 
@@ -2402,13 +2769,24 @@ def main():
         sys.exit(3)
 
     env = read_env(project_dir)
+    register_secret_values(env)
     drv = get_driver(project_dir, env, dev=dev)
     res = Result(args.cmd)
     try:
         args.fn(drv, env, args, res)
     except KeyboardInterrupt:
         sys.exit(130)
+    except subprocess.TimeoutExpired as e:
+        # A capped exec is the whole point of EXEC_TIMEOUT: report which
+        # command stalled and for how long, rather than "internal error".
+        program = e.cmd[0] if isinstance(e.cmd, (list, tuple)) and e.cmd else str(e.cmd)
+        res.fail("timed out after %ss running %s; the container or cluster did "
+                 "not respond" % (int(e.timeout or 0), scrub(str(program))))
+        res.say("check service state with `cli/autohub status --json`")
     except Exception as e:  # a crash must still honor the output contract
+        if os.environ.get("AUTOHUB_DEBUG"):
+            import traceback
+            traceback.print_exc()
         res.fail("internal error: %s" % scrub(str(e)))
     sys.exit(res.emit(as_json))
 

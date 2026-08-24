@@ -173,8 +173,13 @@ AutoHub treats operational verification as part of every change:
   resolved target identifier.
 - Risky operations require a completed recovery point outside the storage being
   changed.
+- `db query` runs one read-only statement as the unprivileged application
+  account; a diagnostic write needs `--write --force` and the resolved target.
+- Every container command is time-capped, so a wedged container or an
+  unreachable cluster returns a failed result instead of hanging.
 - Passwords, tokens, sessions, private keys, and `.env` contents must never be
-  reproduced in output or commits.
+  reproduced in output or commits. Output is redacted both by token shape and
+  by the project's own secret values.
 - A certificate warning is a failed local deployment prerequisite; browser QA
   must not silently switch to HTTP and claim completion.
 - Database dumps are identified as database-only; they are not presented as
@@ -211,6 +216,12 @@ platform-specific NSS package.
 Kubernetes deployments require access to the selected cluster plus `kubectl`
 and Helm. Ingress and certificate management depend on the generated project's
 cluster configuration.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE). AutoHub deploys HUBzero CMS but bundles none of
+its source; the CMS is cloned at run time and remains under its own GPL-2.0
+license.
 
 ## Further reading
 

@@ -213,7 +213,7 @@ Every command takes the global flags `--json`, `--dev`, `--project-dir` in
 either position. What's implemented in [`cli/autohub`](../assets/scaffold/cli/autohub) today:
 
 ```
-autohub init      [--site --preset --template-url --force]  → scripts/hub-init.sh
+autohub init      [--site --preset <name|path> --template-url --force]  → scripts/hub-init.sh
 autohub up        [--wait --timeout]                 → compose up -d --build; --wait blocks on "bootstrap complete"
 autohub down                                         → compose down (keeps volumes)
 autohub destroy   --force --confirm <target> --snapshot <dir> → delete volumes only after target + recovery validation
@@ -223,9 +223,9 @@ autohub provision                                    → hub-provision; parses "
 autohub verify    [--scope all|site|tls|assets|components|mail|login|db] [--route PATH]   (R9)
 autohub assets    build|clean|lint                   → host LESS preflight + hub-assets (R5)
 autohub cache     clear [--warm]                     → hub-muse cache clear (+ warm request) (R6)
-autohub doctor    [--tail]                           → recent web logs → known-cause table (R10)
+autohub doctor    [--tail --all-boots]               → current boot's web logs → known-cause table (R10)
 autohub logs      [--errors --tail --limit --follow] → web logs, secret-scrubbed
-autohub db        shell|query <SQL>|dump|restore     → mariadb client; host-side dump, guarded restore
+autohub db        shell|query <SQL>|dump|restore     → mariadb client; query is read-only unless --write --force --confirm; host-side dump, guarded restore
 autohub backup    create|restore                     → host-side DB + hub_app + TLS + config snapshot/restore
 autohub migrate                                      → hub-migrate
 autohub ext       list|install|enable|disable        → jos_extensions list; mutate via hub.yml + provision (R4)

@@ -44,7 +44,8 @@ Options:
   --template <alias>       Active site template, e.g. NaN
   --template-url <git>     Repository to clone the template from
   --template-branch <ref>  Branch to track (default: main)
-  --preset <name>          Start hub.yml from presets/<name>.yml
+  --preset <name|path>     Start hub.yml from presets/<name>.yml, or from
+                           any manifest path (this scaffold ships no presets/)
   --http-port <n>          Host HTTP port  (default: first free from 8080)
   --https-port <n>         Host HTTPS port (default: first free from 8443)
   --interactive            Prompt for anything not supplied
@@ -247,9 +248,32 @@ if [ -f hub.yml ] && [ -s hub.yml ] && [ "$FORCE" = '0' ] \
 	&& ! grep -q '^# Declarative hub setup. See hub.yml.example' hub.yml; then
 	note "hub.yml already exists; leaving it alone (use --force to replace)"
 elif [ -n "$PRESET" ]; then
-	[ -f "presets/$PRESET.yml" ] || die "no preset at presets/$PRESET.yml"
-	cp "presets/$PRESET.yml" hub.yml
-	note "wrote hub.yml from presets/$PRESET.yml"
+	# A generated project is standalone -- it has no path back to the skill
+	# directory -- so a bare name resolves against the project's own
+	# presets/. Accepting a path as well keeps the flag usable before a
+	# preset library exists here, instead of failing on a directory that the
+	# scaffold does not ship.
+	case "$PRESET" in
+		*/*|*.yml|*.yaml) PRESET_FILE="$PRESET" ;;
+		*)                PRESET_FILE="presets/$PRESET.yml" ;;
+	esac
+	if [ ! -f "$PRESET_FILE" ]; then
+		# `|| true`: with `set -euo pipefail` a failing ls (no presets/ at
+		# all -- the common case) would abort the script before die() could
+		# explain anything, which is the very failure being reported.
+		# Two plain substitutions rather than `\.ya\?ml$`: BSD sed (macOS)
+		# reads `\?` as a literal question mark, so the GNU form leaves the
+		# extension on and the suggested names come out unusable.
+		available=$(ls presets/*.yml presets/*.yaml 2>/dev/null \
+			| sed 's#^presets/##; s#\.yml$##; s#\.yaml$##' | tr '\n' ' ' || true)
+		[ -n "$available" ] || available='(none -- this project ships no presets/ directory)'
+		die "no preset at $PRESET_FILE
+  looked in: $(pwd)/$PRESET_FILE
+  available: $available
+  --preset also accepts a path to any manifest, e.g. --preset ../shared/research-hub.yml"
+	fi
+	cp "$PRESET_FILE" hub.yml
+	note "wrote hub.yml from $PRESET_FILE"
 else
 	{
 		echo "# Declarative hub setup. See hub.yml.example for every option."

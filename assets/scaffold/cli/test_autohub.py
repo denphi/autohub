@@ -65,6 +65,30 @@ def load_autohub():
 autohub = load_autohub()
 
 
+def read_cli_source():
+    path = os.path.join(os.path.dirname(__file__), "autohub")
+    with open(path, encoding="utf-8") as stream:
+        return stream.read()
+
+
+class RecordingDriver:
+    """Records every exec instead of running one, so a test can prove a
+    refused command never reached the container at all."""
+
+    name = "docker"
+
+    def __init__(self, project_dir):
+        self.dir = project_dir
+        self.calls = []
+
+    def target_id(self):
+        return "docker:" + os.path.realpath(self.dir)
+
+    def exec(self, service, command, **_kwargs):
+        self.calls.append((service, command))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+
 class FakeDriver:
     name = "docker"
 
@@ -197,6 +221,346 @@ class SafetyTests(unittest.TestCase):
             autohub.cmd_destroy(driver, {}, args, result)
             self.assertTrue(result.ok)
             self.assertTrue(driver.destroyed)
+
+
+class ReadOnlyQueryTests(unittest.TestCase):
+    """`db query` is the path an agent reaches for most casually during
+    diagnosis. SKILL.md calls it read-only; these prove the CLI enforces it."""
+
+    READ_ONLY = [
+        "SELECT * FROM jos_extensions",
+        "select id, alias from jos_content where state = 1 limit 10;",
+        "SHOW TABLES",
+        "SHOW CREATE TABLE jos_menu",          # contains "create", still a read
+        "DESCRIBE jos_resources",
+        "EXPLAIN SELECT * FROM jos_content",
+        "WITH t AS (SELECT id FROM jos_content) SELECT COUNT(*) FROM t",
+        "SELECT * FROM jos_content WHERE title = 'drop table jos_users; --'",
+        "SELECT `weird;column` FROM jos_content",
+        "SELECT * FROM jos_content WHERE note = 'a''b; DELETE FROM x'",
+    ]
+
+    MUTATING = [
+        "DROP TABLE jos_users",
+        "DELETE FROM jos_users WHERE 1",
+        "UPDATE jos_content SET state = 0",
+        "TRUNCATE jos_session",
+        "INSERT INTO jos_content VALUES (1)",
+        "GRANT ALL ON *.* TO 'x'@'%'",
+        "SET GLOBAL general_log = 1",
+        "CALL some_proc()",
+        # `mariadb -e` runs every statement in the string, so a smuggled
+        # second statement is a complete bypass of the verb allowlist.
+        "SELECT 1; DROP TABLE jos_users",
+        "SELECT 1 /* x */; DROP TABLE jos_users",
+        # MySQL requires whitespace after `--`, so this really is two
+        # statements at the server even though it looks commented out.
+        "SELECT 1--1; DROP TABLE jos_users",
+        # A CTE may feed UPDATE/DELETE in MariaDB.
+        "WITH t AS (SELECT id FROM jos_content) DELETE FROM jos_content"
+        " WHERE id IN (SELECT id FROM t)",
+        # Writes a webshell into the document root without any write verb.
+        "SELECT * FROM jos_users INTO OUTFILE '/var/www/html/pwn.php'",
+        "SELECT LOAD_FILE('/etc/passwd')",
+        "-- just a comment",
+        "",
+    ]
+
+    def test_read_only_statements_are_accepted(self):
+        for sql in self.READ_ONLY:
+            self.assertEqual("", autohub._reject_non_read_only_sql(sql), sql)
+
+    def test_mutating_statements_are_refused(self):
+        for sql in self.MUTATING:
+            self.assertNotEqual("", autohub._reject_non_read_only_sql(sql), sql)
+
+    def test_query_refuses_a_write_and_never_reaches_the_database(self):
+        with tempfile.TemporaryDirectory() as project:
+            driver = RecordingDriver(project)
+            args = type("Args", (), {
+                "sub": "query", "arg": "DELETE FROM jos_users",
+                "write": False, "force": False, "confirm": None, "json": True,
+            })()
+            result = autohub.Result("db")
+            autohub.cmd_db(driver, {}, args, result)
+            self.assertFalse(result.ok)
+            self.assertEqual([], driver.calls)
+
+    def test_read_query_uses_the_unprivileged_account_and_a_read_only_session(self):
+        with tempfile.TemporaryDirectory() as project:
+            driver = RecordingDriver(project)
+            args = type("Args", (), {
+                "sub": "query", "arg": "SELECT 1",
+                "write": False, "force": False, "confirm": None, "json": True,
+            })()
+            autohub.cmd_db(driver, {}, args, autohub.Result("db"))
+            command = " ".join(driver.calls[0][1])
+            self.assertIn("$MARIADB_USER", command)
+            self.assertNotIn("MARIADB_ROOT_PASSWORD", command)
+            self.assertIn("SET SESSION TRANSACTION READ ONLY", command)
+
+    def test_write_query_requires_force_and_exact_target(self):
+        with tempfile.TemporaryDirectory() as project:
+            driver = RecordingDriver(project)
+            args = type("Args", (), {
+                "sub": "query", "arg": "UPDATE jos_content SET state = 0",
+                "write": True, "force": True, "confirm": "wrong", "json": True,
+            })()
+            result = autohub.Result("db")
+            autohub.cmd_db(driver, {}, args, result)
+            self.assertFalse(result.ok)
+            self.assertEqual([], driver.calls)
+
+            args.confirm = driver.target_id()
+            autohub.cmd_db(driver, {}, args, autohub.Result("db"))
+            self.assertEqual(1, len(driver.calls))
+
+    def test_write_flag_is_exposed_and_defaults_off(self):
+        parser = autohub.build_parser()
+        self.assertFalse(parser.parse_args(["db", "query", "SELECT 1"]).write)
+        self.assertTrue(parser.parse_args(
+            ["db", "query", "UPDATE x SET y=1", "--write"]).write)
+
+
+class SecretRedactionTests(unittest.TestCase):
+    """SECRET_RE only knows token *shapes*. A generated password echoed back
+    by mariadb, apache or git matches none of them, so scrub() also redacts
+    the literal values this project holds."""
+
+    def setUp(self):
+        self.saved = autohub.SECRET_VALUES
+
+    def tearDown(self):
+        autohub.SECRET_VALUES = self.saved
+
+    def test_literal_secret_values_are_redacted_in_every_form(self):
+        autohub.register_secret_values({
+            "DB_PASSWORD": "Xq7vNp2LmR8s",
+            "HUB_SECRET": "abcdefghijklmnop",
+        })
+        for text in ("Access denied for user 'hub'@'%': Xq7vNp2LmR8s",
+                     "mariadb -uroot -pXq7vNp2LmR8s hub",
+                     "password: Xq7vNp2LmR8s",
+                     "rendered app.php with secret abcdefghijklmnop"):
+            self.assertNotIn("Xq7vNp2LmR8s", autohub.scrub(text))
+            self.assertNotIn("abcdefghijklmnop", autohub.scrub(text))
+            self.assertIn("[redacted]", autohub.scrub(text))
+
+    def test_non_secret_and_trivial_values_are_left_alone(self):
+        autohub.register_secret_values({
+            "DB_USER": "hubuser",
+            "HUB_SITENAME": "Research Hub",
+            "HUB_SMTP_PASSWORD": "",          # unset
+            "TEST_USER_PASSWORD": "short1",   # too short to redact safely
+        })
+        text = "Research Hub as hubuser with short1"
+        self.assertEqual(text, autohub.scrub(text))
+
+    def test_pattern_based_redaction_still_applies(self):
+        autohub.register_secret_values({})
+        self.assertIn("[redacted]", autohub.scrub(
+            "https://oauth2:glpat-AAAABBBBCCCC@gitlab.example/x.git"))
+
+
+class ExecTimeoutTests(unittest.TestCase):
+    """An uncapped exec hangs the CLI forever, which leaves an agent driving
+    this contract with nothing to react to."""
+
+    def test_container_exec_is_capped_by_default(self):
+        with tempfile.TemporaryDirectory() as project:
+            driver = autohub.DockerDriver(project, {})
+            seen = {}
+
+            def fake_run(args, **kwargs):
+                seen.update(kwargs)
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with mock.patch.object(subprocess, "run", fake_run):
+                driver.exec("web", ["true"])
+            self.assertEqual(autohub.EXEC_TIMEOUT, seen.get("timeout"))
+
+    def test_slow_commands_raise_the_cap_rather_than_removing_it(self):
+        source = read_cli_source()
+        for call, cap in (('["hub-provision"]', "PROVISION_TIMEOUT"),
+                          ('["hub-migrate"]', "PROVISION_TIMEOUT")):
+            self.assertIn("%s, timeout=%s" % (call, cap), source)
+        self.assertGreater(autohub.UPDATE_TIMEOUT, autohub.EXEC_TIMEOUT)
+        self.assertGreater(autohub.STREAM_TIMEOUT, autohub.EXEC_TIMEOUT)
+
+    def test_timeout_is_reported_as_a_contract_result_not_a_crash(self):
+        # The specific handler must precede the catch-all inside main(), or a
+        # timeout is reported as an opaque "internal error".
+        main_body = read_cli_source().split("\ndef main():", 1)[1]
+        self.assertIn("except subprocess.TimeoutExpired", main_body)
+        self.assertLess(main_body.index("except subprocess.TimeoutExpired"),
+                        main_body.index("except Exception as e:"))
+
+
+class BootScopedLogTests(unittest.TestCase):
+    """Container logs are cumulative, so an error from the boot you just fixed
+    must not fail the retry that fixed it."""
+
+    MARKER = "\x1b[0;36m[hub]\x1b[0m HUBzero container starting"
+
+    def _buffer(self, *boots):
+        return "\n".join(self.MARKER + "\n" + b for b in boots)
+
+    def test_previous_boot_error_does_not_fail_the_current_boot(self):
+        text = self._buffer("\x1b[0;31m[hub] ERROR:\x1b[0m schema import failed",
+                            "all good\n[hub] bootstrap complete")
+        current = autohub._current_boot_log(autohub.ANSI_RE.sub("", text))
+        self.assertNotIn("ERROR", current)
+        self.assertIn("bootstrap complete", current)
+
+    def test_current_boot_error_is_still_detected(self):
+        text = self._buffer("fine", "\x1b[0;31m[hub] ERROR:\x1b[0m schema import failed")
+        current = autohub._current_boot_log(autohub.ANSI_RE.sub("", text))
+        self.assertRegex(current, r"\[hub\] ERROR")
+
+    def test_marker_survives_the_colour_codes_lib_sh_emits(self):
+        # lib.sh prints "\033[0;36m[hub]\033[0m <message>", so the reset code
+        # sits between "[hub]" and the text: a literal "[hub] HUBzero..."
+        # search finds nothing.
+        self.assertIn(autohub.BOOT_MARKER, autohub.ANSI_RE.sub("", self.MARKER))
+
+    def test_missing_marker_falls_back_to_the_whole_buffer(self):
+        text = "no marker here, older image"
+        self.assertEqual(text, autohub._current_boot_log(text))
+
+    def test_wait_reads_a_window_large_enough_to_hold_the_marker(self):
+        # A fixed 400-line tail can let "bootstrap complete" scroll past
+        # between 10s polls on a chatty first boot.
+        self.assertGreaterEqual(autohub.BOOT_LOG_LINES, 2000)
+        self.assertIn("tail=BOOT_LOG_LINES", read_cli_source())
+
+    def test_doctor_exposes_an_all_boots_escape_hatch(self):
+        parser = autohub.build_parser()
+        self.assertFalse(parser.parse_args(["doctor"]).all_boots)
+        self.assertTrue(parser.parse_args(["doctor", "--all-boots"]).all_boots)
+
+
+class HelmValuesTests(unittest.TestCase):
+    """helm splits --set on unescaped commas, so an ordinary hub name became a
+    second, bogus key."""
+
+    def _driver(self, env, **kube):
+        driver = autohub.KubernetesDriver.__new__(autohub.KubernetesDriver)
+        driver.env = env
+        driver.rel = "autohub"
+        driver.backup = kube.get("backup", {})
+        driver.ingress_host = kube.get("ingress_host", "")
+        return driver
+
+    def test_a_comma_in_a_hub_name_survives(self):
+        driver = self._driver({"HUB_SITENAME": "Nanoscale Hub, Inc.",
+                               "DB_NAME": "hub"})
+        rendered = autohub._render_yaml(driver.release_values())
+        self.assertIn('HUB_SITENAME: "Nanoscale Hub, Inc."', rendered)
+
+    def test_values_are_rendered_as_json_compatible_yaml(self):
+        driver = self._driver({"HUB_SITENAME": 'quote " colon: hash # comma,'})
+        rendered = autohub._render_yaml(driver.release_values())
+        line = [l for l in rendered.splitlines() if "HUB_SITENAME" in l][0]
+        value = line.split(": ", 1)[1]
+        self.assertEqual('quote " colon: hash # comma,', json.loads(value))
+
+    def test_image_tag_stays_a_string_as_set_string_guaranteed(self):
+        driver = self._driver({"HUB_IMAGE": "reg.example/hub:1.2"})
+        rendered = autohub._render_yaml(driver.release_values())
+        self.assertIn('tag: "1.2"', rendered)      # not the float 1.2
+
+    def test_typed_chart_values_stay_typed(self):
+        driver = self._driver({}, backup={"enabled": "true", "keep": "7"})
+        rendered = autohub._render_yaml(driver.release_values())
+        self.assertIn("enabled: true", rendered)
+        self.assertIn("keep: 7", rendered)
+
+    def test_secrets_no_longer_travel_in_argv(self):
+        # HUBZERO_REPO may carry a token, and --set-string put it in argv.
+        # Match the quoted argv form, not the word: the docstring explaining
+        # why the flag was dropped legitimately names it.
+        source = read_cli_source()
+        self.assertNotIn('"--set-string"', source)
+        self.assertIn("mkstemp", source)
+
+    def test_generated_values_are_applied_after_user_overlays(self):
+        # helm lets a later -f win, which is what now preserves ".env identity
+        # beats a tuning overlay" -- the --set flags used to guarantee it.
+        up_body = read_cli_source().split("    def up(self):", 1)[1]
+        self.assertLess(up_body.index("for values in self.values_files"),
+                        up_body.index("mkstemp"))
+
+
+class SiteUrlResolutionTests(unittest.TestCase):
+    """Without an ingress host the driver used to hand out the placeholder
+    "https://<rel-web service>", and every HTTP check failed with HTTP 0."""
+
+    def _driver(self, ingress_host="", discovered=None):
+        driver = autohub.KubernetesDriver.__new__(autohub.KubernetesDriver)
+        driver.rel = "autohub"
+        driver.ingress_host = ingress_host
+        driver._discovered_host = discovered
+        driver._kubectl = ["kubectl", "-n", "autohub"]
+        driver.dir = "."
+        return driver
+
+    def test_configured_host_wins(self):
+        self.assertEqual("https://hub.example.org",
+                         self._driver(ingress_host="hub.example.org").url())
+
+    def test_host_is_discovered_from_the_cluster_ingress(self):
+        driver = self._driver()
+        with mock.patch.object(
+                driver, "_run",
+                return_value=subprocess.CompletedProcess([], 0, "found.example.org", "")):
+            self.assertEqual("https://found.example.org", driver.url())
+
+    def test_unresolvable_url_is_empty_not_a_placeholder(self):
+        driver = self._driver(discovered="")
+        self.assertEqual("", driver.url())
+        self.assertNotIn("<", driver.url())
+
+    def test_verify_reports_one_actionable_failure_not_a_wall_of_http_zero(self):
+        driver = self._driver(discovered="")
+        driver.name = "kubernetes"
+        args = type("Args", (), {"scope": "all", "route": []})()
+        result = autohub.Result("verify")
+        with mock.patch.object(
+                driver, "_run",
+                return_value=subprocess.CompletedProcess([], 0, "", "")):
+            with mock.patch.object(autohub, "http_get") as fetched:
+                autohub.cmd_verify(driver, {}, args, result)
+        fetched.assert_not_called()
+        names = [c["name"] for c in result.checks]
+        self.assertIn("site URL resolvable", names)
+        self.assertFalse(result.checks[0]["ok"])
+        self.assertIn("ingress_host", result.checks[0]["info"])
+
+
+class AdminLoginTrustTests(unittest.TestCase):
+    """The one probe that transmits a credential must not cross a connection
+    that would accept any certificate."""
+
+    def test_credentials_are_withheld_from_an_untrusted_connection(self):
+        with mock.patch.object(autohub, "_host_https_trust",
+                               return_value=(False, "self signed certificate")):
+            with mock.patch.object(autohub.urllib.request, "build_opener") as opener:
+                ok, detail = autohub._try_admin_login(
+                    "https://localhost:8443", "admin", "hunter2")
+        self.assertFalse(ok)
+        self.assertIn("untrusted connection", detail)
+        opener.assert_not_called()      # the password was never sent
+
+    def test_a_trusted_connection_still_performs_the_login(self):
+        with mock.patch.object(autohub, "_host_https_trust",
+                               return_value=(True, "host trust store accepted")):
+            with mock.patch.object(autohub.urllib.request, "build_opener") as opener:
+                opener.return_value.open.side_effect = OSError("stop here")
+                ok, detail = autohub._try_admin_login(
+                    "https://localhost:8443", "admin", "hunter2")
+        opener.assert_called_once()
+        self.assertFalse(ok)
+        self.assertNotIn("untrusted connection", detail)
 
 
 class ContentProvisioningTests(unittest.TestCase):
