@@ -1049,8 +1049,46 @@ if (!empty($manifest['articles']))
 				$set[] = '`' . $column . '` = ' . $db->quote($value);
 			}
 
+			// Compare before writing.
+			//
+			// This block used to UPDATE unconditionally, which made a restart
+			// silently destroy anything edited in the admin panel: the manifest
+			// simply won, every boot, with no record of what it replaced. That
+			// is unrecoverable in a stock hub -- `modified` is not among the
+			// columns written here so it still shows the human's edit time,
+			// com_content versioning is off by default, and MariaDB binlog is
+			// off in the shipped compose and chart.
+			//
+			// Skipping identical rows also turns the boot log into a real change
+			// record: "article <alias>" now means the manifest actually changed
+			// something, instead of appearing on every boot regardless.
 			if ($existing)
 			{
+				$db->setQuery("SELECT `" . implode('`, `', array_keys($fields)) . "`
+					FROM `#__content` WHERE `id` = " . (int) $existing);
+				$current = $db->loadAssoc();
+
+				if ($current)
+				{
+					$differs = false;
+
+					foreach ($fields as $column => $value)
+					{
+						// Loose compare on purpose: the columns are read back as
+						// strings, so an int 1 from the manifest must match "1".
+						if ((string) $current[$column] !== (string) $value)
+						{
+							$differs = true;
+							break;
+						}
+					}
+
+					if (!$differs)
+					{
+						return false;
+					}
+				}
+
 				$db->setQuery("UPDATE `#__content` SET " . implode(', ', $set)
 					. " WHERE `id` = " . (int) $existing);
 			}
@@ -1604,7 +1642,6 @@ function menuItem($db, $item, $type, $client, $order, $parentId, $parentPath, $l
         'alias'        => $alias,
         'link'         => $item['link'],
         'type'         => $itemType,
-        'published'    => isset($item['published']) ? (int) $item['published'] : 1,
         'access'       => isset($item['access']) ? (int) $item['access'] : 1,
         'home'         => !empty($item['home']) ? 1 : 0,
         'client_id'    => $client,
@@ -1612,6 +1649,21 @@ function menuItem($db, $item, $type, $client, $order, $parentId, $parentPath, $l
         'ordering'     => $order + 1,
         'component_id' => $componentId,
     );
+
+    // `published` is set only when the manifest actually says so, and on a row
+    // this run creates. Defaulting it to 1 for an EXISTING row meant an item
+    // switched off in the admin panel came back at the next restart, every
+    // restart, with nothing in the log to explain it. Declaring an item is a
+    // statement about where it lives in the menu, not a standing instruction to
+    // re-publish it; say `published: 0` to hold one down.
+    if (isset($item['published']))
+    {
+        $fields['published'] = (int) $item['published'];
+    }
+    elseif (!$existing)
+    {
+        $fields['published'] = 1;
+    }
 
     $set = array();
 
@@ -1769,7 +1821,8 @@ if (!empty($manifest['menus']))
             {
                 $db->setQuery("UPDATE `#__menu` SET `published` = 0 WHERE `id` = " . (int) $stray->id);
                 $db->query();
-                info("unpublished stray menu item '" . $stray->title . "'");
+                info("unpublished stray menu item '" . $stray->title . "'"
+                    . " -- declare it under menus." . $menutype . ".items to keep it");
                 $changed++;
             }
         }

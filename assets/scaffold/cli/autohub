@@ -150,6 +150,58 @@ def scrub(text):
 # driver layer
 # ---------------------------------------------------------------------------
 
+GZIP_MAGIC = b"\x1f\x8b"
+
+
+def _repair_streamed_payload(path):
+    """Drop anything a cluster injected ahead of the payload, or say it is bad.
+
+    `kubectl exec` gives a command's stdout no channel of its own, so a runtime
+    that prints a notice on the way in -- Geddes emits "nvidia driver modules
+    are not yet loaded, invoking runc directly" -- lands that text *inside* the
+    stream. A gzip file gains a leading text line and stops being a gzip file.
+
+    This is not cosmetic. It silently produced a full-state snapshot whose three
+    artifacts were all unreadable, with sha256 sums recorded over the corrupted
+    bytes so `backup restore` would have refused them, discovered only when the
+    backup was needed. Fail loudly here instead: a backup that cannot be trusted
+    is worse than no backup, because it is mistaken for protection.
+
+    Returns None on success, or a message describing why the payload is unusable.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+    except OSError as e:
+        return "could not read %s: %s" % (path, e)
+
+    if head.startswith(GZIP_MAGIC):
+        return None
+
+    offset = head.find(GZIP_MAGIC)
+
+    if offset < 0:
+        return ("%s is not gzip and no gzip header was found in the first %d "
+                "bytes; the command likely failed and wrote a message instead"
+                % (os.path.basename(path), len(head)))
+
+    prefix = head[:offset]
+
+    # Only ever strip a short run of injected TEXT. Binary before the header
+    # means something else is wrong, and truncating it would hide that.
+    if len(prefix) > 512 or b"\x00" in prefix:
+        return ("%s has %d unexpected bytes before the gzip header; refusing to "
+                "guess where the payload starts" % (os.path.basename(path), len(prefix)))
+
+    with open(path, "rb") as f:
+        body = f.read()
+
+    with open(path, "wb") as f:
+        f.write(body[offset:])
+
+    return None
+
+
 class DockerDriver:
     """Run the hub as a Docker Compose project."""
 
@@ -229,8 +281,12 @@ class DockerDriver:
         with open(path, "wb") as out:
             r = subprocess.run(self.compose + ["exec", "-T", service] + cmd,
                                cwd=self.dir, stdout=out, stderr=subprocess.PIPE)
-        return subprocess.CompletedProcess(r.args, r.returncode, "",
-                                           r.stderr.decode("utf-8", "replace"))
+        stderr = r.stderr.decode("utf-8", "replace")
+        if r.returncode == 0:
+            bad = _repair_streamed_payload(path)
+            if bad:
+                return subprocess.CompletedProcess(r.args, 1, "", (stderr + "\n" + bad).strip())
+        return subprocess.CompletedProcess(r.args, r.returncode, "", stderr)
 
     def stream_from_file(self, service, cmd, path):
         """Stream a host file to a command's stdin without putting it in argv."""
@@ -449,6 +505,12 @@ class KubernetesDriver:
         args = self._kubectl + ["exec", "-c", container, ref, "--"] + cmd
         with open(path, "wb") as out:
             r = subprocess.run(args, cwd=self.dir, stdout=out, stderr=subprocess.PIPE)
+        # A cluster runtime can print a notice into this stream; see
+        # _repair_streamed_payload. Never hand back a corrupted artifact.
+        if r.returncode == 0:
+            bad = _repair_streamed_payload(path)
+            if bad:
+                return subprocess.CompletedProcess(r.args, 1, "", bad)
         return subprocess.CompletedProcess(r.args, r.returncode, "",
                                            r.stderr.decode("utf-8", "replace"))
 

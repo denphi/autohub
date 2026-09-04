@@ -295,6 +295,16 @@ modules:
 #                 in the menu is *unpublished* (never deleted, so hand-built
 #                 items stay recoverable)
 #
+# prune is the setting most likely to surprise an operator. An item added in the
+# admin panel and NOT listed here is switched off again at the next restart, so
+# it appears to keep vanishing. The boot log names it and says what to do:
+#   unpublished stray menu item 'Careers' -- declare it under menus.site.items
+#
+# The mirror image: `published` is written only when this file says so. A listed
+# item that omits the key is published when this run creates it and otherwise
+# left as it is, so unpublishing something in the admin panel sticks. Say
+# `published: 0` to hold an item down across restarts.
+#
 # `home: true` marks the front page; exactly one site item may have it.
 # The database enforces alias uniqueness on (client_id, parent_id, alias,
 # language) -- across ALL menutypes. Two items may share an alias only under
